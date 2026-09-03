@@ -42,6 +42,53 @@
 #define COUNT 1024
 #endif
 
+// Candidate A: avoid 128-bit SWAR arithmetic for the wide-radix 16-byte case.
+// Each half fits in uint64_t; only the final constant multiply is 128-bit.
+namespace split8_candidate {
+
+template <unsigned Radix, unsigned Len>
+    requires (((17 <= Radix && Radix <= 31) || (33 <= Radix && Radix <= 36)) &&
+              Len == 16 && BitsNeeded(Radix, Len) <= kFastconvMaxBits)
+constexpr result_t<Radix, Len> str2int(const char* str) noexcept {
+    using R = result_t<Radix, Len>;
+    constexpr R r8 = Pow<R>(Radix, 8);
+    return static_cast<R>(static_cast<R>(fastconv::str2int<Radix, 8>(str)) * r8 +
+                          fastconv::str2int<Radix, 8>(str + 8));
+}
+
+}  // namespace split8_candidate
+
+#ifdef FASTCONV_HAS_SIMD
+// Candidate B: reduce SIMD-produced radix^8 blocks as a balanced tree instead
+// of a serial Horner chain. The arithmetic count is unchanged but dependency
+// depth falls from O(n) to O(log n).
+namespace balanced_simd_candidate {
+
+template <unsigned Radix, unsigned Count, typename R>
+inline R Combine(const uint64_t* part) noexcept {
+    if constexpr (Count == 1) {
+        return static_cast<R>(part[0]);
+    } else {
+        constexpr unsigned half = Count / 2;
+        constexpr R scale = Pow<R>(Radix, 8 * half);
+        return static_cast<R>(Combine<Radix, half, R>(part) * scale +
+                              Combine<Radix, half, R>(part + half));
+    }
+}
+
+template <unsigned Radix, unsigned Len>
+    requires (2 <= Radix && Radix <= 36 &&
+              (Len == 16 || Len == 32 || Len == 64 || Len == 128) &&
+              BitsNeeded(Radix, Len) <= kFastconvMaxBits)
+inline result_t<Radix, Len> str2int(const char* str) noexcept {
+    uint64_t part[Len / 8];
+    simd::Blocks<Radix, Len>(str, part);
+    return Combine<Radix, Len / 8, result_t<Radix, Len>>(part);
+}
+
+}  // namespace balanced_simd_candidate
+#endif
+
 namespace {
 
 constexpr unsigned kStride = 144;  // 128 chars + slack, NUL padded
@@ -94,13 +141,16 @@ enum Column {
     kFromChars,
     kV0,
     kNow,
+    kSplit8,
     kMulLevel,
     kSimd,
+    kBalancedSimd,
     kNumColumns,
 };
 
 const char* kColumnNames[kNumColumns] = {
-    "atoi", "strtoull", "stoi", "from_chars", "v0", "fastconv", "mullevel", "simd",
+    "atoi", "strtoull", "stoi", "from_chars", "v0", "fastconv", "split8",
+    "mullevel", "simd", "simd_bal",
 };
 
 struct Cell {
@@ -259,9 +309,11 @@ void Row() {
 
         MEASURE(v0, kV0, R, L)
         MEASURE(fastconv, kNow, R, L)
+        MEASURE(split8_candidate, kSplit8, R, L)
         MEASURE(mullevel, kMulLevel, R, L)
 #ifdef FASTCONV_HAS_SIMD
         MEASURE(simd, kSimd, R, L)
+        MEASURE(balanced_simd_candidate, kBalancedSimd, R, L)
 #endif
         gTable.push_back(row);
         std::fflush(stdout);
