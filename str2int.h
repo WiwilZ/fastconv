@@ -402,9 +402,9 @@ constexpr result_t<Radix, Len> str2int(const char* str) noexcept {
 // Radix 2 uses a multiply bit-gather; the other power-of-two radices build
 // Len >= 16 from two independent 8-character 64-bit halves; radix 3, [5, 7] and
 // [9, 15] use one multiply per reduction level. All three replaced the original
-// 128-bit SWAR chains after benchmarking (see benchmark.txt).
-// [17, 36] keeps the masked SWAR - see the note on that group for why the
-// one-multiply form cannot be used there.
+// 128-bit SWAR chains after benchmarking (see benchmark_str2int.txt).
+// [17, 36] keeps masked SWAR inside each 8-character half - see the note on
+// that group for why the one-multiply form cannot be used there.
 // ============================================================================
 namespace fastconv {
 
@@ -726,17 +726,9 @@ template <unsigned Radix, unsigned Len>
               BitsNeeded(Radix, Len) <= kFastconvMaxBits)
 constexpr result_t<Radix, Len> str2int(const char* str) noexcept {
     using R = result_t<Radix, Len>;
-    constexpr R r1 = Radix;
-    constexpr R r2 = r1 * r1;
-    constexpr R r4 = r2 * r2;
-    constexpr R r8 = r4 * r4;
-
-    auto t = ImplWide<Radix, Len>(str);
-    t = (t & Broadcast<pack_t<Len>, 16>(0x00ff)) * r1 + (t >> 8 & Broadcast<pack_t<Len>, 16>(0x00ff));
-    t = (t & Broadcast<pack_t<Len>, 32>(0x0000ffff)) * r2 + (t >> 16 & Broadcast<pack_t<Len>, 32>(0x0000ffff));
-    t = (t & Broadcast<pack_t<Len>, 64>(0x00000000ffffffff)) * r4 + (t >> 32 & Broadcast<pack_t<Len>, 64>(0x00000000ffffffff));
-    t = static_cast<uint64_t>(t) * r8 + static_cast<uint64_t>(t >> 64);
-    return t;
+    constexpr R r8 = Pow<R>(Radix, 8);
+    return static_cast<R>(static_cast<R>(str2int<Radix, 8>(str)) * r8 +
+                          str2int<Radix, 8>(str + 8));
 }
 /*----------------------------------------[17, 31]U[33, 36]----------------------------------------*/
 

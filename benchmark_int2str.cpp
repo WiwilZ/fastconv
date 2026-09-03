@@ -51,137 +51,6 @@
 #define COUNT 1024
 #endif
 
-// Candidate A: four digits per lookup. Limiting this to selected small radices
-// keeps each table within 10 KiB; larger tables quickly lose to arithmetic due
-// to cache pressure.
-template <unsigned Radix>
-struct QuadTable {
-    static constexpr std::size_t kSize = Radix * Radix * Radix * Radix;
-    uint32_t packed[kSize];
-
-    constexpr QuadTable() : packed{} {
-        for (std::size_t i = 0; i < kSize; ++i) {
-            std::size_t v = i;
-            const unsigned d3 = static_cast<unsigned>(v % Radix);
-            v /= Radix;
-            const unsigned d2 = static_cast<unsigned>(v % Radix);
-            v /= Radix;
-            const unsigned d1 = static_cast<unsigned>(v % Radix);
-            v /= Radix;
-            const unsigned d0 = static_cast<unsigned>(v);
-            packed[i] = static_cast<uint32_t>(DigitChar(d0)) |
-                        static_cast<uint32_t>(DigitChar(d1)) << 8 |
-                        static_cast<uint32_t>(DigitChar(d2)) << 16 |
-                        static_cast<uint32_t>(DigitChar(d3)) << 24;
-        }
-    }
-};
-
-template <unsigned Radix>
-inline constexpr QuadTable<Radix> kQuadTable{};
-
-namespace quad_candidate {
-
-template <unsigned Radix>
-concept SmallTableRadix = Radix == 3 || Radix == 5 || Radix == 6 || Radix == 7;
-
-template <unsigned Radix, unsigned Len>
-    requires (SmallTableRadix<Radix> &&
-              (Len == 4 || Len == 8 || Len == 16 ||
-               Len == 32 || Len == 64 || Len == 128) &&
-              BitsNeeded(Radix, Len) <= kFastconvMaxBits)
-constexpr void int2str(char* out, result_t<Radix, Len> value) noexcept {
-    if constexpr (Len == 4) {
-        Store<uint32_t>(out, kQuadTable<Radix>.packed[static_cast<std::size_t>(value)]);
-    } else {
-        constexpr unsigned low_len = Len / 2;
-        constexpr unsigned high_len = Len - low_len;
-        constexpr auto split = Pow<result_t<Radix, Len>>(Radix, low_len);
-        const auto high = value / split;
-        const auto low = value - high * split;
-        int2str<Radix, high_len>(out, static_cast<result_t<Radix, high_len>>(high));
-        int2str<Radix, low_len>(out + high_len,
-                                static_cast<result_t<Radix, low_len>>(low));
-    }
-}
-
-}  // namespace quad_candidate
-
-#if defined(FASTCONV_X86_SIMD) || defined(FASTCONV_ARM_SIMD)
-// Candidate B: fixed-width decimal conversion based on reciprocal division and
-// packed lane arithmetic. This is deliberately specialised: generalising it to
-// every radix adds constants and instructions that lose to the pair table.
-namespace decimal16_candidate {
-
-inline void Convert(char* out, uint64_t value) noexcept {
-#if defined(FASTCONV_X86_SIMD)
-    constexpr int kDiv10000Shift = 45;
-    const uint32_t high8 = static_cast<uint32_t>(value / 100000000u);
-    const uint32_t low8 = static_cast<uint32_t>(value - uint64_t(high8) * 100000000u);
-    const __m128i chunks = _mm_set_epi64x(low8, high8);
-
-    const __m128i div10000 = _mm_set1_epi32(static_cast<int>(0xd1b71759u));
-    const __m128i q10000 = _mm_srli_epi64(_mm_mul_epu32(chunks, div10000), kDiv10000Shift);
-    const __m128i r10000 =
-        _mm_sub_epi32(chunks, _mm_mul_epu32(q10000, _mm_set1_epi32(10000)));
-    const __m128i groups100 = _mm_or_si128(q10000, _mm_slli_epi64(r10000, 32));
-
-    const __m128i q100 = _mm_srli_epi16(
-        _mm_mulhi_epu16(groups100, _mm_set1_epi16(0x147b)), 3);
-    const __m128i r100 =
-        _mm_sub_epi16(groups100, _mm_mullo_epi16(q100, _mm_set1_epi16(100)));
-    const __m128i pairs = _mm_or_si128(q100, _mm_slli_epi32(r100, 16));
-
-    const __m128i tens = _mm_mulhi_epu16(pairs, _mm_set1_epi16(0x199a));
-    const __m128i ones =
-        _mm_sub_epi16(pairs, _mm_mullo_epi16(tens, _mm_set1_epi16(10)));
-    const __m128i digits = _mm_add_epi8(
-        _mm_or_si128(tens, _mm_slli_epi16(ones, 8)), _mm_set1_epi8('0'));
-    _mm_storeu_si128(reinterpret_cast<__m128i*>(out), digits);
-#else
-#if FASTCONV_HAS_NATIVE_UINT128
-    const uint32_t high8 = static_cast<uint32_t>(
-        (static_cast<fastconv_uint128_t>(value) * 0xabcc77118461cefdull) >> 90);
-#else
-    const uint32_t high8 = static_cast<uint32_t>(value / 100000000u);
-#endif
-    const uint32_t low8 = static_cast<uint32_t>(value - uint64_t(high8) * 100000000u);
-    const uint32x2_t chunks = vcreate_u32(uint64_t(high8) | uint64_t(low8) << 32);
-
-    const int32x2_t q10000 = vshr_n_s32(
-        vqdmulh_s32(vreinterpret_s32_u32(chunks), vdup_n_s32(0x068db8bb)), 9);
-    const int32x2_t groups100 = vmla_s32(
-        vreinterpret_s32_u32(chunks), q10000, vdup_n_s32(0x10000 - 10000));
-
-    const int32x4_t zero = vdupq_n_s32(0);
-    const uint16x8x2_t interleaved = vzipq_u16(
-        vreinterpretq_u16_s32(vcombine_s32(groups100, vdup_n_s32(0))),
-        vreinterpretq_u16_s32(zero));
-    const int32x4_t widened = vreinterpretq_s32_u16(interleaved.val[0]);
-    const int32x4_t q100 =
-        vqdmulhq_s32(widened, vdupq_n_s32(0x0147b000));
-    const int32x4_t pairs =
-        vmlaq_s32(widened, q100, vdupq_n_s32(0x10000 - 100));
-
-    const int16x8_t q10 = vqdmulhq_s16(vreinterpretq_s16_s32(pairs),
-                                        vdupq_n_s16(0x0ce0));
-    const int16x8_t digits = vmlaq_s16(
-        vreinterpretq_s16_s8(vaddq_s8(vreinterpretq_s8_s32(pairs), vdupq_n_s8('0'))),
-        q10, vdupq_n_s16(0x100 - 10));
-    const uint8x16_t ordered = vrev64q_u8(vreinterpretq_u8_s16(digits));
-    vst1q_u8(reinterpret_cast<uint8_t*>(out), ordered);
-#endif
-}
-
-template <unsigned Radix, unsigned Len>
-    requires (Radix == 10 && Len == 16)
-inline void int2str(char* out, result_t<Radix, Len> value) noexcept {
-    Convert(out, static_cast<uint64_t>(value));
-}
-
-}  // namespace decimal16_candidate
-#endif
-
 namespace {
 
 constexpr unsigned kStride = 144;  // 128 chars + slack for wide stores
@@ -199,7 +68,7 @@ uint64_t Rand() noexcept {
     return s;
 }
 
-// COUNT random values with a non-zero leading digit, plus their strings.
+// Boundary patterns first, then random values with a non-zero leading digit.
 struct Corpus {
     std::vector<fastconv_widest_uint_t> value;
     std::vector<std::string> want;
@@ -211,7 +80,18 @@ struct Corpus {
             std::string s;
             fastconv_widest_uint_t v = 0;
             for (unsigned j = 0; j < len; ++j) {
-                const unsigned d = j == 0 ? 1 + Rand() % (radix - 1) : Rand() % radix;
+                unsigned d;
+                if (i == 0) {
+                    d = j == 0 ? 1 : 0;
+                } else if (i == 1) {
+                    d = radix - 1;
+                } else if (i == 2) {
+                    d = j == 0 ? 1 : j < len / 2 ? 0 : radix - 1;
+                } else if (i == 3) {
+                    d = j == 0 || j + 1 == len / 2 ? 1 : 0;
+                } else {
+                    d = j == 0 ? 1 + Rand() % (radix - 1) : Rand() % radix;
+                }
                 s += kDigits[d];
                 v = v * radix + d;
             }
@@ -229,15 +109,12 @@ enum Column {
     kToChars,
     kV0,
     kFastconv,
-    kQuad,
     kSimd,
-    kDecimal16,
     kNumColumns,
 };
 
 const char* kColumnNames[kNumColumns] = {
-    "snprintf", "itoa", "to_string", "format", "to_chars", "v0", "fastconv",
-    "quad", "simd", "decimal16",
+    "snprintf", "itoa", "to_string", "format", "to_chars", "v0", "fastconv", "simd",
 };
 
 struct Cell {
@@ -395,10 +272,8 @@ void Row() {
         }
         MEASURE(v0, kV0, R, L)
         MEASURE(fastconv, kFastconv, R, L)
-        MEASURE(quad_candidate, kQuad, R, L)
 #ifdef FASTCONV_INT2STR_HAS_SIMD
         MEASURE(simd, kSimd, R, L)
-        MEASURE(decimal16_candidate, kDecimal16, R, L)
 #endif
         gTable.push_back(row);
         std::fflush(stdout);

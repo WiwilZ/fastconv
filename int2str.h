@@ -95,6 +95,39 @@ struct Pairs {
 template <unsigned Radix>
 constexpr Pairs<Radix> kPairs{};
 
+// Four-digit tables stay reasonably small only for these radices: 324 bytes
+// for radix 3, then 2500, 5184, and 9604 bytes for radices 5, 6, and 7.
+template <unsigned Radix>
+concept QuadTableRadix = Radix == 3 || Radix == 5 || Radix == 6 || Radix == 7;
+
+template <unsigned Radix>
+    requires QuadTableRadix<Radix>
+struct Quads {
+    static constexpr std::size_t kSize = Radix * Radix * Radix * Radix;
+    uint32_t packed[kSize];
+
+    constexpr Quads() : packed{} {
+        for (std::size_t i = 0; i < kSize; ++i) {
+            std::size_t v = i;
+            const unsigned d3 = static_cast<unsigned>(v % Radix);
+            v /= Radix;
+            const unsigned d2 = static_cast<unsigned>(v % Radix);
+            v /= Radix;
+            const unsigned d1 = static_cast<unsigned>(v % Radix);
+            v /= Radix;
+            const unsigned d0 = static_cast<unsigned>(v);
+            packed[i] = static_cast<uint32_t>(DigitChar(d0)) |
+                        static_cast<uint32_t>(DigitChar(d1)) << 8 |
+                        static_cast<uint32_t>(DigitChar(d2)) << 16 |
+                        static_cast<uint32_t>(DigitChar(d3)) << 24;
+        }
+    }
+};
+
+template <unsigned Radix>
+    requires QuadTableRadix<Radix>
+inline constexpr Quads<Radix> kQuads{};
+
 template <unsigned Radix>
 concept Pow2Radix = Radix == 2 || Radix == 4 || Radix == 8 || Radix == 16 || Radix == 32;
 
@@ -229,13 +262,17 @@ constexpr void int2str(char* out, result_t<Radix, Len> value) noexcept {
         const unsigned i = static_cast<unsigned>(value);
         out[0] = kPairs<Radix>.c[i][0];
         out[1] = kPairs<Radix>.c[i][1];
+    } else if constexpr (QuadTableRadix<Radix> && Len == 4) {
+        Store<uint32_t>(out, kQuads<Radix>.packed[static_cast<std::size_t>(value)]);
     } else {
         constexpr unsigned kLow = Len / 2;
         constexpr unsigned kHigh = Len - kLow;
         constexpr auto kSplit = Pow<result_t<Radix, Len>>(Radix, kLow);
+        const auto high = value / kSplit;
+        const auto low = value - high * kSplit;
 
-        int2str<Radix, kHigh>(out, static_cast<result_t<Radix, kHigh>>(value / kSplit));
-        int2str<Radix, kLow>(out + kHigh, static_cast<result_t<Radix, kLow>>(value % kSplit));
+        int2str<Radix, kHigh>(out, static_cast<result_t<Radix, kHigh>>(high));
+        int2str<Radix, kLow>(out + kHigh, static_cast<result_t<Radix, kLow>>(low));
     }
 }
 
@@ -326,7 +363,8 @@ constexpr std::size_t int2str(char* out, T value, unsigned radix) noexcept {
 // subtract and one narrowing interleave. Everything above that level stays
 // scalar because the values are too wide for useful lanes.
 //
-// Only the NEON path has been executed; SSE4.1 is compile-verified only.
+// Decimal 16-character blocks use a separate reciprocal-division pipeline;
+// the general path below remains preferable for other radices and widths.
 // ============================================================================
 #if defined(FASTCONV_X86_SIMD) || defined(FASTCONV_ARM_SIMD)
 #define FASTCONV_INT2STR_HAS_SIMD 1
@@ -338,6 +376,68 @@ constexpr std::size_t int2str(char* out, T value, unsigned radix) noexcept {
 #endif
 
 namespace simd {
+
+// Exactly 16 decimal digits, split into two 8-digit chunks and reduced in
+// parallel. All reciprocal quotients are exact over the bounded lane ranges.
+inline void Decimal16(char* out, uint64_t value) noexcept {
+#if defined(FASTCONV_X86_SIMD)
+    constexpr int kDiv10000Shift = 45;
+    const uint32_t high8 = static_cast<uint32_t>(value / 100000000u);
+    const uint32_t low8 = static_cast<uint32_t>(value - uint64_t(high8) * 100000000u);
+    const __m128i chunks = _mm_set_epi64x(low8, high8);
+
+    const __m128i div10000 = _mm_set1_epi32(static_cast<int>(0xd1b71759u));
+    const __m128i q10000 = _mm_srli_epi64(_mm_mul_epu32(chunks, div10000), kDiv10000Shift);
+    const __m128i r10000 =
+        _mm_sub_epi32(chunks, _mm_mul_epu32(q10000, _mm_set1_epi32(10000)));
+    const __m128i groups100 = _mm_or_si128(q10000, _mm_slli_epi64(r10000, 32));
+
+    const __m128i q100 = _mm_srli_epi16(
+        _mm_mulhi_epu16(groups100, _mm_set1_epi16(0x147b)), 3);
+    const __m128i r100 =
+        _mm_sub_epi16(groups100, _mm_mullo_epi16(q100, _mm_set1_epi16(100)));
+    const __m128i pairs = _mm_or_si128(q100, _mm_slli_epi32(r100, 16));
+
+    const __m128i tens = _mm_mulhi_epu16(pairs, _mm_set1_epi16(0x199a));
+    const __m128i ones =
+        _mm_sub_epi16(pairs, _mm_mullo_epi16(tens, _mm_set1_epi16(10)));
+    const __m128i digits = _mm_add_epi8(
+        _mm_or_si128(tens, _mm_slli_epi16(ones, 8)), _mm_set1_epi8('0'));
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(out), digits);
+#else
+#if FASTCONV_HAS_NATIVE_UINT128
+    const uint32_t high8 = static_cast<uint32_t>(
+        (static_cast<fastconv_uint128_t>(value) * 0xabcc77118461cefdull) >> 90);
+#else
+    const uint32_t high8 = static_cast<uint32_t>(value / 100000000u);
+#endif
+    const uint32_t low8 = static_cast<uint32_t>(value - uint64_t(high8) * 100000000u);
+    const uint32x2_t chunks = vcreate_u32(uint64_t(high8) | uint64_t(low8) << 32);
+
+    const int32x2_t q10000 = vshr_n_s32(
+        vqdmulh_s32(vreinterpret_s32_u32(chunks), vdup_n_s32(0x068db8bb)), 9);
+    const int32x2_t groups100 = vmla_s32(
+        vreinterpret_s32_u32(chunks), q10000, vdup_n_s32(0x10000 - 10000));
+
+    const int32x4_t zero = vdupq_n_s32(0);
+    const uint16x8x2_t interleaved = vzipq_u16(
+        vreinterpretq_u16_s32(vcombine_s32(groups100, vdup_n_s32(0))),
+        vreinterpretq_u16_s32(zero));
+    const int32x4_t widened = vreinterpretq_s32_u16(interleaved.val[0]);
+    const int32x4_t q100 =
+        vqdmulhq_s32(widened, vdupq_n_s32(0x0147b000));
+    const int32x4_t pairs =
+        vmlaq_s32(widened, q100, vdupq_n_s32(0x10000 - 100));
+
+    const int16x8_t q10 = vqdmulhq_s16(vreinterpretq_s16_s32(pairs),
+                                        vdupq_n_s16(0x0ce0));
+    const int16x8_t digits = vmlaq_s16(
+        vreinterpretq_s16_s8(vaddq_s8(vreinterpretq_s8_s32(pairs), vdupq_n_s8('0'))),
+        q10, vdupq_n_s16(0x100 - 10));
+    const uint8x16_t ordered = vrev64q_u8(vreinterpretq_u8_s16(digits));
+    vst1q_u8(reinterpret_cast<uint8_t*>(out), ordered);
+#endif
+}
 
 // Eight digits from four pair values, pair[0] the most significant.
 template <unsigned Radix>
@@ -381,7 +481,9 @@ template <unsigned Radix, unsigned Len>
 constexpr void int2str(char* out, result_t<Radix, Len> value) noexcept {
     constexpr auto kGroup = Pow<result_t<Radix, Len>>(Radix, 8);
 
-    if constexpr (Len > 8) {
+    if constexpr (Radix == 10 && Len == 16) {
+        Decimal16(out, static_cast<uint64_t>(value));
+    } else if constexpr (Len > 8) {
         int2str<Radix, Len - 8>(out, static_cast<result_t<Radix, Len - 8>>(value / kGroup));
         int2str<Radix, 8>(out + Len - 8,
                           static_cast<result_t<Radix, 8>>(value % kGroup));
