@@ -8,7 +8,8 @@
 #include <type_traits>
 
 
-#if defined(__SIZEOF_INT128__) && !defined(FASTCONV_DISABLE_UINT128)
+#if defined(__SIZEOF_INT128__) && !defined(_MSC_VER) && \
+    !defined(FASTCONV_DISABLE_UINT128)
 #define FASTCONV_HAS_NATIVE_UINT128 1
 using fastconv_uint128_t = unsigned __int128;
 using fastconv_widest_uint_t = fastconv_uint128_t;

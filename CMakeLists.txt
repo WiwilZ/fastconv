@@ -4,6 +4,10 @@ project(fastconv_benchmarks LANGUAGES CXX)
 
 option(FASTCONV_NATIVE_ARCH "Enable instructions for the runner's native CPU" ON)
 
+if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)

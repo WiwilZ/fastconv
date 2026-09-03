@@ -226,7 +226,7 @@ void Row() {
             }
 #if defined(_WIN32)
             row.cells[kItoa] = Measure(corpus, L, [&corpus](char* p, unsigned i) {
-                _ui64toa(static_cast<unsigned long long>(corpus.value[i]), p, R);
+                _ui64toa_s(static_cast<unsigned long long>(corpus.value[i]), p, kStride, R);
                 return FoldOut<L>(p);
             });
 #endif

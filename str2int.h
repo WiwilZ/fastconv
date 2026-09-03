@@ -284,7 +284,7 @@ constexpr fastconv_uint128_t str2int(const char* str) noexcept {
 
 /*----------------------------------------[5, 7]U[9, 15]----------------------------------------*/
 template <unsigned Radix, unsigned Len>
-    requires ((5 <= Radix && Radix <= 7 || 9 <= Radix && Radix <= 15) && Len == 4)
+    requires (((5 <= Radix && Radix <= 7) || (9 <= Radix && Radix <= 15)) && Len == 4)
 constexpr uint16_t str2int(const char* str) noexcept {
     constexpr uint16_t r1 = Radix;
     constexpr uint16_t r2 = r1 * r1;
@@ -295,7 +295,7 @@ constexpr uint16_t str2int(const char* str) noexcept {
 }
 
 template <unsigned Radix, unsigned Len>
-    requires ((5 <= Radix && Radix <= 7 || 9 <= Radix && Radix <= 15) && Len == 8)
+    requires (((5 <= Radix && Radix <= 7) || (9 <= Radix && Radix <= 15)) && Len == 8)
 constexpr uint32_t str2int(const char* str) noexcept {
     constexpr uint32_t r1 = Radix;
     constexpr uint32_t r2 = r1 * r1;
@@ -308,7 +308,7 @@ constexpr uint32_t str2int(const char* str) noexcept {
 }
 
 template <unsigned Radix, unsigned Len>
-    requires ((5 <= Radix && Radix <= 7 || 9 <= Radix && Radix <= 15) && Len == 16)
+    requires (((5 <= Radix && Radix <= 7) || (9 <= Radix && Radix <= 15)) && Len == 16)
 constexpr uint64_t str2int(const char* str) noexcept {
     constexpr uint64_t r1 = Radix;
     constexpr uint64_t r2 = r1 * r1;
@@ -323,7 +323,7 @@ constexpr uint64_t str2int(const char* str) noexcept {
 }
 
 template <unsigned Radix, unsigned Len>
-    requires ((5 <= Radix && Radix <= 7 || 9 <= Radix && Radix <= 15) && Len == 32)
+    requires (((5 <= Radix && Radix <= 7) || (9 <= Radix && Radix <= 15)) && Len == 32)
 constexpr fastconv_uint128_t str2int(const char* str) noexcept {
     constexpr auto r16 = Pow<fastconv_uint128_t>(Radix, 16);
     return static_cast<fastconv_uint128_t>(str2int<Radix, 16>(str)) * r16 +
@@ -359,7 +359,7 @@ constexpr uint64_t str2int(const char* str) noexcept {
 }
 
 template <unsigned Radix, unsigned Len>
-    requires ((17 <= Radix && Radix <= 31 || 33 <= Radix && Radix <= 36) && Len == 16)
+    requires (((17 <= Radix && Radix <= 31) || (33 <= Radix && Radix <= 36)) && Len == 16)
 constexpr fastconv_uint128_t str2int(const char* str) noexcept {
     constexpr fastconv_uint128_t r1 = Radix;
     constexpr fastconv_uint128_t r2 = r1 * r1;
@@ -722,7 +722,7 @@ constexpr uint64_t str2int(const char* str) noexcept {
 }
 
 template <unsigned Radix, unsigned Len>
-    requires ((17 <= Radix && Radix <= 31 || 33 <= Radix && Radix <= 36) && Len == 16 &&
+    requires (((17 <= Radix && Radix <= 31) || (33 <= Radix && Radix <= 36)) && Len == 16 &&
               BitsNeeded(Radix, Len) <= kFastconvMaxBits)
 constexpr result_t<Radix, Len> str2int(const char* str) noexcept {
     using R = result_t<Radix, Len>;
