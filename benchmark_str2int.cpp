@@ -65,13 +65,13 @@ uint64_t Rand() noexcept {
 struct Corpus {
     std::vector<char> text;
     std::vector<std::string> strs;  // same values, for the std::stoi family
-    std::vector<__uint128_t> want;
+    std::vector<fastconv_widest_uint_t> want;
 
     Corpus(unsigned radix, unsigned len) : text(COUNT * kStride, '\0'), want(COUNT) {
         strs.reserve(COUNT);
         for (unsigned i = 0; i < COUNT; ++i) {
             char* p = text.data() + i * kStride;
-            __uint128_t v = 0;
+            fastconv_widest_uint_t v = 0;
             for (unsigned j = 0; j < len; ++j) {
                 const unsigned d = Rand() % radix;
                 char c = kDigits[d];
@@ -122,7 +122,12 @@ std::vector<TableRow> gTable;
 // fit in 64 bits the high half is a provable zero and costs nothing.
 template <typename T>
 inline uint64_t Fold(T v) noexcept {
-    return static_cast<uint64_t>(v) ^ static_cast<uint64_t>(static_cast<__uint128_t>(v) >> 64);
+#if FASTCONV_HAS_NATIVE_UINT128
+    return static_cast<uint64_t>(v) ^
+           static_cast<uint64_t>(static_cast<fastconv_uint128_t>(v) >> 64);
+#else
+    return static_cast<uint64_t>(v);
+#endif
 }
 
 // f is called as f(pointer_to_digits, corpus_index); columns that need a
@@ -200,7 +205,7 @@ Cell Measure(const Corpus& corpus, F f) {
 #define MEASURE(NS, COL, R, L)                                                          \
     if constexpr (requires { NS::str2int<R, L>(static_cast<const char*>(nullptr)); }) { \
         row.cells[COL] = Measure(corpus, [](const char* p, unsigned) {                  \
-            return static_cast<__uint128_t>(NS::str2int<R, L>(p));                      \
+            return static_cast<fastconv_widest_uint_t>(NS::str2int<R, L>(p));         \
         });                                                                             \
     }
 
@@ -215,40 +220,40 @@ void Row() {
         // The atoi family takes no base, so it only applies to radix 10.
         if constexpr (R == 10 && kBits <= 31) {
             row.cells[kAtoi] = Measure(corpus, [](const char* p, unsigned) {
-                return static_cast<__uint128_t>(std::atoi(p));
+                return static_cast<fastconv_widest_uint_t>(std::atoi(p));
             });
         } else if constexpr (R == 10 && kBits <= 63) {
             row.cells[kAtoi] = Measure(corpus, [](const char* p, unsigned) {
-                return static_cast<__uint128_t>(std::atoll(p));
+                return static_cast<fastconv_widest_uint_t>(std::atoll(p));
             });
         }
         if constexpr (kBits <= 63) {
             row.cells[kStrtoull] = Measure(corpus, [](const char* p, unsigned) {
-                return static_cast<__uint128_t>(std::strtoll(p, nullptr, R));
+                return static_cast<fastconv_widest_uint_t>(std::strtoll(p, nullptr, R));
             });
         } else if constexpr (kBits <= 64) {
             row.cells[kStrtoull] = Measure(corpus, [](const char* p, unsigned) {
-                return static_cast<__uint128_t>(std::strtoull(p, nullptr, R));
+                return static_cast<fastconv_widest_uint_t>(std::strtoull(p, nullptr, R));
             });
         }
         if constexpr (kBits <= 31) {
             row.cells[kStoi] = Measure(corpus, [&corpus](const char*, unsigned i) {
-                return static_cast<__uint128_t>(std::stoi(corpus.strs[i], nullptr, R));
+                return static_cast<fastconv_widest_uint_t>(std::stoi(corpus.strs[i], nullptr, R));
             });
         } else if constexpr (kBits <= 63) {
             row.cells[kStoi] = Measure(corpus, [&corpus](const char*, unsigned i) {
-                return static_cast<__uint128_t>(std::stoll(corpus.strs[i], nullptr, R));
+                return static_cast<fastconv_widest_uint_t>(std::stoll(corpus.strs[i], nullptr, R));
             });
         } else if constexpr (kBits <= 64) {
             row.cells[kStoi] = Measure(corpus, [&corpus](const char*, unsigned i) {
-                return static_cast<__uint128_t>(std::stoull(corpus.strs[i], nullptr, R));
+                return static_cast<fastconv_widest_uint_t>(std::stoull(corpus.strs[i], nullptr, R));
             });
         }
         if constexpr (kBits <= 64) {
             row.cells[kFromChars] = Measure(corpus, [](const char* p, unsigned) {
                 unsigned long long v = 0;
                 std::from_chars(p, p + L, v, R);
-                return static_cast<__uint128_t>(v);
+                return static_cast<fastconv_widest_uint_t>(v);
             });
         }
 
@@ -383,7 +388,12 @@ void PrintHeader(const char* title, int width) {
 
 int main() {
     std::printf("compiler : ");
-#if defined(__clang__)
+#if defined(__clang__) && defined(_MSC_VER)
+    std::printf("clang-cl %d.%d.%d (MSVC ABI %d)", __clang_major__, __clang_minor__,
+                __clang_patchlevel__, _MSC_VER);
+#elif defined(_MSC_VER)
+    std::printf("msvc %d", _MSC_VER);
+#elif defined(__clang__)
     std::printf("clang %d.%d.%d", __clang_major__, __clang_minor__, __clang_patchlevel__);
 #elif defined(__GNUC__)
     std::printf("gcc %d.%d.%d", __GNUC__, __GNUC_MINOR__, __GNUC_PATCHLEVEL__);
@@ -391,9 +401,9 @@ int main() {
     std::printf("unknown");
 #endif
     std::printf("\ntarget   : ");
-#if defined(__x86_64__)
+#if defined(__x86_64__) || defined(_M_X64)
     std::printf("x86-64");
-#elif defined(__aarch64__)
+#elif defined(__aarch64__) || defined(_M_ARM64)
     std::printf("aarch64");
 #else
     std::printf("unknown");
@@ -403,6 +413,7 @@ int main() {
 #else
     std::printf(" (simd namespace DISABLED - no SSE4.1/NEON)");
 #endif
+    std::printf("\nuint128  : %s", FASTCONV_HAS_NATIVE_UINT128 ? "native" : "unavailable");
     std::printf("\nsampling : TRIALS=%d BLOCK=%d (=> %d samples) TARGET_US=%d COUNT=%d\n", TRIALS,
                 BLOCK, TRIALS / BLOCK, TARGET_US, COUNT);
     PrintCpu();

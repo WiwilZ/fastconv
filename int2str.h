@@ -51,12 +51,12 @@ consteval T MaskKeep(unsigned keep, unsigned period) noexcept {
 template <typename T>
 constexpr T ByteReverse(T x) noexcept {
     if constexpr (sizeof(T) == 4) {
-        return __builtin_bswap32(x);
+        return std::byteswap(static_cast<uint32_t>(x));
     } else if constexpr (sizeof(T) == 8) {
-        return __builtin_bswap64(x);
+        return std::byteswap(static_cast<uint64_t>(x));
     } else {
-        const uint64_t lo = __builtin_bswap64(static_cast<uint64_t>(x));
-        const uint64_t hi = __builtin_bswap64(static_cast<uint64_t>(x >> 64));
+        const uint64_t lo = std::byteswap(static_cast<uint64_t>(x));
+        const uint64_t hi = std::byteswap(static_cast<uint64_t>(x >> 64));
         return static_cast<T>(lo) << 64 | hi;
     }
 }
@@ -119,7 +119,9 @@ concept Pow2Radix = Radix == 2 || Radix == 4 || Radix == 8 || Radix == 16 || Rad
 namespace v0 {
 
 template <unsigned Radix, unsigned Len>
-    requires (Pow2Radix<Radix> && (Len == 4 || Len == 8 || Len == 16))
+    requires (Pow2Radix<Radix> &&
+              (Len == 4 || Len == 8 ||
+               (Len == 16 && FASTCONV_HAS_NATIVE_UINT128 != 0)))
 constexpr void int2str(char* out, result_t<Radix, Len> value) noexcept {
     using T = pack_t<Len>;
     constexpr unsigned kBits = BitsNeeded(Radix, 1);
@@ -130,7 +132,9 @@ constexpr void int2str(char* out, result_t<Radix, Len> value) noexcept {
 
 // Longer power-of-two inputs split into two independent halves.
 template <unsigned Radix, unsigned Len>
-    requires (Pow2Radix<Radix> && Len > 16 && BitsNeeded(Radix, Len) <= 128)
+    requires (Pow2Radix<Radix> &&
+              (Len > 16 || (Len == 16 && FASTCONV_HAS_NATIVE_UINT128 == 0)) &&
+              BitsNeeded(Radix, Len) <= kFastconvMaxBits)
 constexpr void int2str(char* out, result_t<Radix, Len> value) noexcept {
     constexpr unsigned kLow = BitsNeeded(Radix, Len / 2);
 
@@ -139,7 +143,8 @@ constexpr void int2str(char* out, result_t<Radix, Len> value) noexcept {
 }
 
 template <unsigned Radix, unsigned Len>
-    requires (!Pow2Radix<Radix> && 2 <= Radix && Radix <= 36 && BitsNeeded(Radix, Len) <= 128)
+    requires (!Pow2Radix<Radix> && 2 <= Radix && Radix <= 36 &&
+              BitsNeeded(Radix, Len) <= kFastconvMaxBits)
 constexpr void int2str(char* out, result_t<Radix, Len> value) noexcept {
     auto v = value;
     for (unsigned i = Len; i-- > 0;) {
@@ -192,7 +197,9 @@ template <unsigned Radix>
 concept MulRadix = !Pow2Radix<Radix> && 3 <= Radix && Radix <= 36;
 
 template <unsigned Radix, unsigned Len>
-    requires (Pow2Radix<Radix> && (Len == 4 || Len == 8 || Len == 16))
+    requires (Pow2Radix<Radix> &&
+              (Len == 4 || Len == 8 ||
+               (Len == 16 && FASTCONV_HAS_NATIVE_UINT128 != 0)))
 constexpr void int2str(char* out, result_t<Radix, Len> value) noexcept {
     using T = pack_t<Len>;
     constexpr unsigned kBits = BitsNeeded(Radix, 1);
@@ -203,7 +210,9 @@ constexpr void int2str(char* out, result_t<Radix, Len> value) noexcept {
 
 // Longer inputs split into two independent halves at a byte boundary.
 template <unsigned Radix, unsigned Len>
-    requires (Pow2Radix<Radix> && Len > 16 && BitsNeeded(Radix, Len) <= 128)
+    requires (Pow2Radix<Radix> &&
+              (Len > 16 || (Len == 16 && FASTCONV_HAS_NATIVE_UINT128 == 0)) &&
+              BitsNeeded(Radix, Len) <= kFastconvMaxBits)
 constexpr void int2str(char* out, result_t<Radix, Len> value) noexcept {
     constexpr unsigned kLow = BitsNeeded(Radix, Len / 2);
 
@@ -212,7 +221,7 @@ constexpr void int2str(char* out, result_t<Radix, Len> value) noexcept {
 }
 
 template <unsigned Radix, unsigned Len>
-    requires (MulRadix<Radix> && BitsNeeded(Radix, Len) <= 128)
+    requires (MulRadix<Radix> && BitsNeeded(Radix, Len) <= kFastconvMaxBits)
 constexpr void int2str(char* out, result_t<Radix, Len> value) noexcept {
     if constexpr (Len == 1) {
         out[0] = DigitChar(static_cast<unsigned>(value));
@@ -319,10 +328,10 @@ constexpr std::size_t int2str(char* out, T value, unsigned radix) noexcept {
 //
 // Only the NEON path has been executed; SSE4.1 is compile-verified only.
 // ============================================================================
-#if defined(__SSE4_1__) || defined(__ARM_NEON) || defined(__aarch64__)
+#if defined(FASTCONV_X86_SIMD) || defined(FASTCONV_ARM_SIMD)
 #define FASTCONV_INT2STR_HAS_SIMD 1
 
-#if defined(__SSE4_1__)
+#if defined(FASTCONV_X86_SIMD)
 #include <immintrin.h>
 #else
 #include <arm_neon.h>
@@ -339,19 +348,18 @@ inline void EightDigits(char* out, const uint16_t pair[4]) noexcept {
     constexpr uint32_t kMagic = (1u << kShift) / Radix + 1;
     static_assert(Pow<uint32_t>(Radix, 2) * kMagic >> kShift <= 0xffff);
 
-#if defined(__SSE4_1__)
+#if defined(FASTCONV_X86_SIMD)
     const __m128i p = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(pair));
     const __m128i hi32 = _mm_srli_epi32(_mm_mullo_epi32(_mm_cvtepu16_epi32(p),
                                                         _mm_set1_epi32(int(kMagic))),
                                         kShift);
     const __m128i hi = _mm_packus_epi32(hi32, hi32);
     const __m128i lo = _mm_sub_epi16(p, _mm_mullo_epi16(hi, _mm_set1_epi16(Radix)));
-    // interleave hi/lo into 8 bytes: hi0 lo0 hi1 lo1 ...
-    const __m128i digits = _mm_packus_epi16(_mm_unpacklo_epi16(hi, lo), _mm_setzero_si128());
-    const __m128i shuf = _mm_shuffle_epi8(
-        digits, _mm_setr_epi8(0, 4, 1, 5, 2, 6, 3, 7, -1, -1, -1, -1, -1, -1, -1, -1));
+    // unpack already interleaves hi/lo as hi0 lo0 hi1 lo1 ...
+    const __m128i digits =
+        _mm_packus_epi16(_mm_unpacklo_epi16(hi, lo), _mm_setzero_si128());
     uint64_t bytes;
-    std::memcpy(&bytes, &shuf, sizeof(bytes));
+    std::memcpy(&bytes, &digits, sizeof(bytes));
     Store<uint64_t>(out, BytesToAscii<Radix, 6>(bytes));
 #else
     const uint16x4_t p = vld1_u16(pair);
@@ -368,7 +376,8 @@ inline void EightDigits(char* out, const uint16_t pair[4]) noexcept {
 }
 
 template <unsigned Radix, unsigned Len>
-    requires (2 <= Radix && Radix <= 36 && Len % 8 == 0 && BitsNeeded(Radix, Len) <= 128)
+    requires (2 <= Radix && Radix <= 36 && Len % 8 == 0 &&
+              BitsNeeded(Radix, Len) <= kFastconvMaxBits)
 constexpr void int2str(char* out, result_t<Radix, Len> value) noexcept {
     constexpr auto kGroup = Pow<result_t<Radix, Len>>(Radix, 8);
 

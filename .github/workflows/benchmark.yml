@@ -2,6 +2,13 @@ name: Cross-platform benchmarks
 
 on:
   workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - "*.h"
+      - "benchmark_*.cpp"
+      - "CMakeLists.txt"
+      - ".github/workflows/benchmark.yml"
 
 permissions:
   contents: read
@@ -15,39 +22,67 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: Ubuntu 24.04 x86-64
-            id: ubuntu-24.04-x86-64
+          - name: Linux x86-64 / GCC
+            id: linux-x86-64-gcc
             runner: ubuntu-24.04
-            cpu_flags: -march=native
-          - name: Ubuntu 24.04 arm64
-            id: ubuntu-24.04-arm64
+            cmake_args: -DCMAKE_CXX_COMPILER=g++
+          - name: Linux x86-64 / Clang
+            id: linux-x86-64-clang
+            runner: ubuntu-24.04
+            cmake_args: -DCMAKE_CXX_COMPILER=clang++
+          - name: Linux arm64 / GCC
+            id: linux-arm64-gcc
             runner: ubuntu-24.04-arm
-            cpu_flags: -mcpu=native
-          - name: macOS 15 Intel
-            id: macos-15-x86-64
+            cmake_args: -DCMAKE_CXX_COMPILER=g++
+          - name: Linux arm64 / Clang
+            id: linux-arm64-clang
+            runner: ubuntu-24.04-arm
+            cmake_args: -DCMAKE_CXX_COMPILER=clang++
+          - name: macOS x86-64 / Apple Clang
+            id: macos-x86-64-clang
             runner: macos-15-intel
-            cpu_flags: -march=native
-          - name: macOS 15 Apple Silicon
-            id: macos-15-arm64
+            cmake_args: -DCMAKE_CXX_COMPILER=clang++
+          - name: macOS arm64 / Apple Clang
+            id: macos-arm64-clang
             runner: macos-15
-            cpu_flags: -mcpu=native
+            cmake_args: -DCMAKE_CXX_COMPILER=clang++
+          - name: Windows x86-64 / MSVC
+            id: windows-x86-64-msvc
+            runner: windows-2025-vs2026
+            cmake_args: -A x64
+          - name: Windows x86-64 / clang-cl
+            id: windows-x86-64-clang-cl
+            runner: windows-2025-vs2026
+            cmake_args: -A x64 -T ClangCL
+          - name: Windows arm64 / MSVC
+            id: windows-arm64-msvc
+            runner: windows-11-vs2026-arm
+            cmake_args: -A ARM64
+          - name: Windows arm64 / clang-cl
+            id: windows-arm64-clang-cl
+            runner: windows-11-vs2026-arm
+            cmake_args: -A ARM64 -T ClangCL
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Record environment
         shell: bash
         run: |
-          mkdir -p build results
+          mkdir -p results
           {
             echo "runner   : ${{ matrix.runner }}"
+            echo "os/arch  : ${RUNNER_OS}/${RUNNER_ARCH}"
             echo "image OS : ${ImageOS:-unknown}"
             echo "image ver: ${ImageVersion:-unknown}"
             echo "uname    : $(uname -a)"
-            echo "compiler : $(clang++ --version | head -n 1)"
-            echo "flags    : -std=c++2c -O3 -DNDEBUG ${{ matrix.cpu_flags }}"
-            if command -v lscpu >/dev/null 2>&1; then
+            echo "toolchain: ${{ matrix.cmake_args }}"
+            echo "cmake    : $(cmake --version | head -n 1)"
+            if [[ "$RUNNER_OS" == "Windows" ]]; then
+              powershell.exe -NoProfile -Command \
+                "Get-CimInstance Win32_Processor | Select-Object -ExpandProperty Name"
+            elif command -v lscpu >/dev/null 2>&1; then
               lscpu
             elif command -v sysctl >/dev/null 2>&1; then
               sysctl -n machdep.cpu.brand_string 2>/dev/null || true
@@ -56,23 +91,33 @@ jobs:
             fi
           } | tee results/environment.txt
 
-      - name: Build benchmarks
+      - name: Configure
         shell: bash
         run: |
-          clang++ -std=c++2c -O3 -DNDEBUG ${{ matrix.cpu_flags }} benchmark_str2int.cpp -o build/benchmark_str2int
-          clang++ -std=c++2c -O3 -DNDEBUG ${{ matrix.cpu_flags }} benchmark_int2str.cpp -o build/benchmark_int2str
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+            -DFASTCONV_NATIVE_ARCH=ON ${{ matrix.cmake_args }} 2>&1 | tee results/configure.txt
+
+      - name: Build benchmarks
+        shell: bash
+        run: cmake --build build --config Release --parallel 1 2>&1 | tee results/build.txt
 
       - name: Run str2int benchmark
         shell: bash
-        run: build/benchmark_str2int | tee results/benchmark_str2int.txt
+        run: |
+          executable=build/bin/benchmark_str2int
+          [[ "$RUNNER_OS" == "Windows" ]] && executable="${executable}.exe"
+          "$executable" | tee results/benchmark_str2int.txt
 
       - name: Run int2str benchmark
         shell: bash
-        run: build/benchmark_int2str | tee results/benchmark_int2str.txt
+        run: |
+          executable=build/bin/benchmark_int2str
+          [[ "$RUNNER_OS" == "Windows" ]] && executable="${executable}.exe"
+          "$executable" | tee results/benchmark_int2str.txt
 
       - name: Upload benchmark results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fastconv-benchmark-${{ matrix.id }}
           path: results/

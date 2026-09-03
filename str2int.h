@@ -26,6 +26,8 @@ constexpr auto Impl(const char* str) {
 
 namespace v0 {
 
+#if FASTCONV_HAS_NATIVE_UINT128
+
 /*----------------------------------------2----------------------------------------*/
 template <unsigned Radix, unsigned Len>
     requires (Radix == 2 && Len == 4)
@@ -70,9 +72,11 @@ constexpr uint64_t str2int(const char* str) noexcept {
 }
 
 template <unsigned Radix, unsigned Len>
-    requires (Radix == 2 && Len == 128)
-constexpr __uint128_t str2int(const char* str) noexcept {
-    return static_cast<__uint128_t>(str2int<2, 64>(str)) << 64 | str2int<2, 64>(str + 64);
+    requires (Radix == 2 && Len == 128 && BitsNeeded(Radix, Len) <= kFastconvMaxBits)
+constexpr result_t<Radix, Len> str2int(const char* str) noexcept {
+    using R = result_t<Radix, Len>;
+    return static_cast<R>(str2int<2, 64>(str)) << 64 |
+           str2int<2, 64>(str + 64);
 }
 /*----------------------------------------2----------------------------------------*/
 
@@ -114,9 +118,11 @@ constexpr uint64_t str2int(const char* str) noexcept {
 }
 
 template <unsigned Radix, unsigned Len>
-    requires (Radix == 4 && Len == 64)
-constexpr __uint128_t str2int(const char* str) noexcept {
-    return static_cast<__uint128_t>(str2int<4, 32>(str)) << 64 | str2int<4, 32>(str + 32);
+    requires (Radix == 4 && Len == 64 && BitsNeeded(Radix, Len) <= kFastconvMaxBits)
+constexpr result_t<Radix, Len> str2int(const char* str) noexcept {
+    using R = result_t<Radix, Len>;
+    return static_cast<R>(str2int<4, 32>(str)) << 64 |
+           str2int<4, 32>(str + 32);
 }
 /*----------------------------------------4----------------------------------------*/
 
@@ -152,9 +158,11 @@ constexpr uint64_t str2int(const char* str) noexcept {
 }
 
 template <unsigned Radix, unsigned Len>
-    requires (Radix == 8 && Len == 32)
-constexpr __uint128_t str2int(const char* str) noexcept {
-    return static_cast<__uint128_t>(str2int<8, 16>(str)) << 48 | str2int<8, 16>(str + 16);
+    requires (Radix == 8 && Len == 32 && BitsNeeded(Radix, Len) <= kFastconvMaxBits)
+constexpr result_t<Radix, Len> str2int(const char* str) noexcept {
+    using R = result_t<Radix, Len>;
+    return static_cast<R>(str2int<8, 16>(str)) << 48 |
+           str2int<8, 16>(str + 16);
 }
 /*----------------------------------------8----------------------------------------*/
 
@@ -190,9 +198,11 @@ constexpr uint64_t str2int(const char* str) noexcept {
 }
 
 template <unsigned Radix, unsigned Len>
-    requires (Radix == 16 && Len == 32)
-constexpr __uint128_t str2int(const char* str) noexcept {
-    return static_cast<__uint128_t>(str2int<16, 16>(str)) << 64 | str2int<16, 16>(str + 16);
+    requires (Radix == 16 && Len == 32 && BitsNeeded(Radix, Len) <= kFastconvMaxBits)
+constexpr result_t<Radix, Len> str2int(const char* str) noexcept {
+    using R = result_t<Radix, Len>;
+    return static_cast<R>(str2int<16, 16>(str)) << 64 |
+           str2int<16, 16>(str + 16);
 }
 /*----------------------------------------16----------------------------------------*/
 
@@ -218,12 +228,12 @@ constexpr uint64_t str2int(const char* str) noexcept {
 
 template <unsigned Radix, unsigned Len>
     requires (Radix == 32 && Len == 16)
-constexpr __uint128_t str2int(const char* str) noexcept {
+constexpr fastconv_uint128_t str2int(const char* str) noexcept {
     auto t = Impl<Radix, Len>(str);
     t = (t << 5 & Broadcast<pack_t<Len>, 16>(0x03e0)) | (t >> 8 & Broadcast<pack_t<Len>, 16>(0x001f));
     t = (t << 10 & Broadcast<pack_t<Len>, 32>(0x000ffcc0)) | (t >> 16 & Broadcast<pack_t<Len>, 32>(0x000003ff));
     t = (t << 20 & Broadcast<pack_t<Len>, 64>(0x000000fffff00000)) | (t >> 32 & Broadcast<pack_t<Len>, 64>(0x00000000000fffff));
-    t = (t << 40 | t >> 64) & ((static_cast<__uint128_t>(1) << 80) - 1);
+    t = (t << 40 | t >> 64) & ((static_cast<fastconv_uint128_t>(1) << 80) - 1);
     return t;
 }
 /*----------------------------------------32----------------------------------------*/
@@ -265,9 +275,10 @@ constexpr uint64_t str2int(const char* str) noexcept {
 
 template <unsigned Radix, unsigned Len>
     requires (Radix == 3 && Len == 64)
-constexpr __uint128_t str2int(const char* str) noexcept {
-    constexpr auto r32 = Pow<__uint128_t>(Radix, 32);
-    return static_cast<__uint128_t>(str2int<3, 32>(str)) * r32 + str2int<3, 32>(str + 32);
+constexpr fastconv_uint128_t str2int(const char* str) noexcept {
+    constexpr auto r32 = Pow<fastconv_uint128_t>(Radix, 32);
+    return static_cast<fastconv_uint128_t>(str2int<3, 32>(str)) * r32 +
+           str2int<3, 32>(str + 32);
 }
 /*----------------------------------------3----------------------------------------*/
 
@@ -313,9 +324,10 @@ constexpr uint64_t str2int(const char* str) noexcept {
 
 template <unsigned Radix, unsigned Len>
     requires ((5 <= Radix && Radix <= 7 || 9 <= Radix && Radix <= 15) && Len == 32)
-constexpr __uint128_t str2int(const char* str) noexcept {
-    constexpr auto r16 = Pow<__uint128_t>(Radix, 16);
-    return static_cast<__uint128_t>(str2int<Radix, 16>(str)) * r16 + str2int<Radix, 16>(str + 16);
+constexpr fastconv_uint128_t str2int(const char* str) noexcept {
+    constexpr auto r16 = Pow<fastconv_uint128_t>(Radix, 16);
+    return static_cast<fastconv_uint128_t>(str2int<Radix, 16>(str)) * r16 +
+           str2int<Radix, 16>(str + 16);
 }
 /*----------------------------------------[5, 7]U[9, 15]----------------------------------------*/
 
@@ -348,11 +360,11 @@ constexpr uint64_t str2int(const char* str) noexcept {
 
 template <unsigned Radix, unsigned Len>
     requires ((17 <= Radix && Radix <= 31 || 33 <= Radix && Radix <= 36) && Len == 16)
-constexpr __uint128_t str2int(const char* str) noexcept {
-    constexpr __uint128_t r1 = Radix;
-    constexpr __uint128_t r2 = r1 * r1;
-    constexpr __uint128_t r4 = r2 * r2;
-    constexpr __uint128_t r8 = r4 * r4;
+constexpr fastconv_uint128_t str2int(const char* str) noexcept {
+    constexpr fastconv_uint128_t r1 = Radix;
+    constexpr fastconv_uint128_t r2 = r1 * r1;
+    constexpr fastconv_uint128_t r4 = r2 * r2;
+    constexpr fastconv_uint128_t r8 = r4 * r4;
 
     auto t = Impl<Radix, Len>(str);
     t = (t & Broadcast<pack_t<Len>, 16>(0x00ff)) * r1 + (t >> 8 & Broadcast<pack_t<Len>, 16>(0x00ff));
@@ -363,6 +375,24 @@ constexpr __uint128_t str2int(const char* str) noexcept {
 }
 /*----------------------------------------[17, 31]U[33, 36]----------------------------------------*/
 
+#else
+
+template <unsigned Radix, unsigned Len>
+    requires (2 <= Radix && Radix <= 36 && BitsNeeded(Radix, Len) <= kFastconvMaxBits)
+constexpr result_t<Radix, Len> str2int(const char* str) noexcept {
+    result_t<Radix, Len> value = 0;
+    for (unsigned i = 0; i < Len; ++i) {
+        const unsigned c = static_cast<unsigned char>(str[i]);
+        const unsigned digit = c <= static_cast<unsigned>('9')
+                                   ? c - static_cast<unsigned>('0')
+                                   : (c | 0x20u) - static_cast<unsigned>('a') + 10;
+        value = static_cast<result_t<Radix, Len>>(value * Radix + digit);
+    }
+    return value;
+}
+
+#endif
+
 }  // namespace v0
 
 
@@ -372,7 +402,7 @@ constexpr __uint128_t str2int(const char* str) noexcept {
 // Radix 2 uses a multiply bit-gather; the other power-of-two radices build
 // Len >= 16 from two independent 8-character 64-bit halves; radix 3, [5, 7] and
 // [9, 15] use one multiply per reduction level. All three replaced the original
-// __uint128_t SWAR chains after benchmarking (see benchmark.txt).
+// 128-bit SWAR chains after benchmarking (see benchmark.txt).
 // [17, 36] keeps the masked SWAR - see the note on that group for why the
 // one-multiply form cannot be used there.
 // ============================================================================
@@ -426,9 +456,11 @@ constexpr uint64_t str2int(const char* str) noexcept {
 }
 
 template <unsigned Radix, unsigned Len>
-    requires (Radix == 2 && Len == 128)
-constexpr __uint128_t str2int(const char* str) noexcept {
-    return static_cast<__uint128_t>(str2int<2, 64>(str)) << 64 | str2int<2, 64>(str + 64);
+    requires (Radix == 2 && Len == 128 && BitsNeeded(Radix, Len) <= kFastconvMaxBits)
+constexpr result_t<Radix, Len> str2int(const char* str) noexcept {
+    using R = result_t<Radix, Len>;
+    return static_cast<R>(str2int<2, 64>(str)) << 64 |
+           str2int<2, 64>(str + 64);
 }
 /*----------------------------------------2----------------------------------------*/
 
@@ -465,9 +497,11 @@ constexpr uint64_t str2int(const char* str) noexcept {
 }
 
 template <unsigned Radix, unsigned Len>
-    requires (Radix == 4 && Len == 64)
-constexpr __uint128_t str2int(const char* str) noexcept {
-    return static_cast<__uint128_t>(str2int<4, 32>(str)) << 64 | str2int<4, 32>(str + 32);
+    requires (Radix == 4 && Len == 64 && BitsNeeded(Radix, Len) <= kFastconvMaxBits)
+constexpr result_t<Radix, Len> str2int(const char* str) noexcept {
+    using R = result_t<Radix, Len>;
+    return static_cast<R>(str2int<4, 32>(str)) << 64 |
+           str2int<4, 32>(str + 32);
 }
 /*----------------------------------------4----------------------------------------*/
 
@@ -498,9 +532,11 @@ constexpr uint64_t str2int(const char* str) noexcept {
 }
 
 template <unsigned Radix, unsigned Len>
-    requires (Radix == 8 && Len == 32)
-constexpr __uint128_t str2int(const char* str) noexcept {
-    return static_cast<__uint128_t>(str2int<8, 16>(str)) << 48 | str2int<8, 16>(str + 16);
+    requires (Radix == 8 && Len == 32 && BitsNeeded(Radix, Len) <= kFastconvMaxBits)
+constexpr result_t<Radix, Len> str2int(const char* str) noexcept {
+    using R = result_t<Radix, Len>;
+    return static_cast<R>(str2int<8, 16>(str)) << 48 |
+           str2int<8, 16>(str + 16);
 }
 /*----------------------------------------8----------------------------------------*/
 
@@ -531,9 +567,11 @@ constexpr uint64_t str2int(const char* str) noexcept {
 }
 
 template <unsigned Radix, unsigned Len>
-    requires (Radix == 16 && Len == 32)
-constexpr __uint128_t str2int(const char* str) noexcept {
-    return static_cast<__uint128_t>(str2int<16, 16>(str)) << 64 | str2int<16, 16>(str + 16);
+    requires (Radix == 16 && Len == 32 && BitsNeeded(Radix, Len) <= kFastconvMaxBits)
+constexpr result_t<Radix, Len> str2int(const char* str) noexcept {
+    using R = result_t<Radix, Len>;
+    return static_cast<R>(str2int<16, 16>(str)) << 64 |
+           str2int<16, 16>(str + 16);
 }
 /*----------------------------------------16----------------------------------------*/
 
@@ -558,9 +596,11 @@ constexpr uint64_t str2int(const char* str) noexcept {
 }
 
 template <unsigned Radix, unsigned Len>
-    requires (Radix == 32 && Len == 16)
-constexpr __uint128_t str2int(const char* str) noexcept {
-    return static_cast<__uint128_t>(str2int<32, 8>(str)) << 40 | str2int<32, 8>(str + 8);
+    requires (Radix == 32 && Len == 16 && BitsNeeded(Radix, Len) <= kFastconvMaxBits)
+constexpr result_t<Radix, Len> str2int(const char* str) noexcept {
+    using R = result_t<Radix, Len>;
+    return static_cast<R>(str2int<32, 8>(str)) << 40 |
+           str2int<32, 8>(str + 8);
 }
 /*----------------------------------------32----------------------------------------*/
 
@@ -611,20 +651,23 @@ constexpr result_t<Radix, Len> str2int(const char* str) noexcept {
 }
 
 template <unsigned Radix, unsigned Len>
-    requires (Multiplicative<Radix> && Len == 32)
+    requires (Multiplicative<Radix> && Len == 32 &&
+              BitsNeeded(Radix, Len) <= kFastconvMaxBits)
 constexpr result_t<Radix, Len> str2int(const char* str) noexcept {
-    constexpr auto r16 = Pow<__uint128_t>(Radix, 16);
-    return static_cast<result_t<Radix, Len>>(
-        static_cast<__uint128_t>(str2int<Radix, 16>(str)) * r16 + str2int<Radix, 16>(str + 16));
+    using R = result_t<Radix, Len>;
+    constexpr auto r16 = Pow<R>(Radix, 16);
+    return static_cast<R>(static_cast<R>(str2int<Radix, 16>(str)) * r16 +
+                          str2int<Radix, 16>(str + 16));
 }
 
 // At 64 characters only radix 3 still fits in 128 bits.
 template <unsigned Radix, unsigned Len>
-    requires (Radix == 3 && Len == 64)
+    requires (Radix == 3 && Len == 64 && BitsNeeded(Radix, Len) <= kFastconvMaxBits)
 constexpr result_t<Radix, Len> str2int(const char* str) noexcept {
-    constexpr auto r32 = Pow<__uint128_t>(Radix, 32);
-    return static_cast<result_t<Radix, Len>>(
-        static_cast<__uint128_t>(str2int<3, 32>(str)) * r32 + str2int<3, 32>(str + 32));
+    using R = result_t<Radix, Len>;
+    constexpr auto r32 = Pow<R>(Radix, 32);
+    return static_cast<R>(static_cast<R>(str2int<3, 32>(str)) * r32 +
+                          str2int<3, 32>(str + 32));
 }
 /*----------------------------------------3, [5, 7], [9, 15]----------------------------------------*/
 
@@ -679,12 +722,14 @@ constexpr uint64_t str2int(const char* str) noexcept {
 }
 
 template <unsigned Radix, unsigned Len>
-    requires ((17 <= Radix && Radix <= 31 || 33 <= Radix && Radix <= 36) && Len == 16)
-constexpr __uint128_t str2int(const char* str) noexcept {
-    constexpr __uint128_t r1 = Radix;
-    constexpr __uint128_t r2 = r1 * r1;
-    constexpr __uint128_t r4 = r2 * r2;
-    constexpr __uint128_t r8 = r4 * r4;
+    requires ((17 <= Radix && Radix <= 31 || 33 <= Radix && Radix <= 36) && Len == 16 &&
+              BitsNeeded(Radix, Len) <= kFastconvMaxBits)
+constexpr result_t<Radix, Len> str2int(const char* str) noexcept {
+    using R = result_t<Radix, Len>;
+    constexpr R r1 = Radix;
+    constexpr R r2 = r1 * r1;
+    constexpr R r4 = r2 * r2;
+    constexpr R r8 = r4 * r4;
 
     auto t = ImplWide<Radix, Len>(str);
     t = (t & Broadcast<pack_t<Len>, 16>(0x00ff)) * r1 + (t >> 8 & Broadcast<pack_t<Len>, 16>(0x00ff));
@@ -801,7 +846,8 @@ constexpr result_t<Radix, Len> str2int(const char* str) noexcept {
 }
 
 template <unsigned Radix, unsigned Len>
-    requires (Packable<Radix> && Len >= 16 && BitsNeeded(Radix, Len) <= 128)
+    requires (Packable<Radix> && Len >= 16 &&
+              BitsNeeded(Radix, Len) <= kFastconvMaxBits)
 constexpr result_t<Radix, Len> str2int(const char* str) noexcept {
     using R = result_t<Radix, Len>;
     constexpr unsigned half = BitsNeeded(Radix, Len / 2);
@@ -833,10 +879,10 @@ constexpr result_t<Radix, Len> str2int(const char* str) noexcept {
 // digits by (Radix, 1) and add". Valid for every Radix <= 36 because
 // 35 * 36 + 35 = 1295 never saturates a 16-bit accumulator.
 // ============================================================================
-#if defined(__SSE4_1__) || defined(__ARM_NEON) || defined(__aarch64__)
+#if defined(FASTCONV_X86_SIMD) || defined(FASTCONV_ARM_SIMD)
 #define FASTCONV_HAS_SIMD 1
 
-#if defined(__SSE4_1__)
+#if defined(FASTCONV_X86_SIMD)
 #include <immintrin.h>
 #else
 #include <arm_neon.h>
@@ -873,7 +919,7 @@ inline void Halves16(const char* str, uint64_t* out) noexcept {
     constexpr uint32_t r2 = r1 * r1;
     constexpr uint32_t r4 = r2 * r2;
 
-#if defined(__SSE4_1__)
+#if defined(FASTCONV_X86_SIMD)
     __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(str));
     if constexpr (Radix <= 10) {
         v = _mm_and_si128(v, _mm_set1_epi8(0x0f));
@@ -1001,9 +1047,9 @@ inline void Blocks(const char* str, uint64_t* out) noexcept {
 
 template <unsigned Radix, unsigned Len>
     requires (2 <= Radix && Radix <= 36 && Len % 16 == 0 && Len <= 128 &&
-              BitsNeeded(Radix, Len) <= 128)
+              BitsNeeded(Radix, Len) <= kFastconvMaxBits)
 inline result_t<Radix, Len> str2int(const char* str) noexcept {
-    constexpr auto r8 = Pow<__uint128_t>(Radix, 8);
+    constexpr auto r8 = Pow<uint64_t>(Radix, 8);
 
     uint64_t part[Len / 8];
     Blocks<Radix, Len>(str, part);
@@ -1015,7 +1061,7 @@ inline result_t<Radix, Len> str2int(const char* str) noexcept {
         }
         return static_cast<result_t<Radix, Len>>(acc);
     } else {
-        __uint128_t acc = part[0];
+        result_t<Radix, Len> acc = part[0];
         for (unsigned i = 1; i < Len / 8; ++i) {
             acc = acc * r8 + part[i];
         }

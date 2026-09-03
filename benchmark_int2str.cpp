@@ -70,7 +70,7 @@ uint64_t Rand() noexcept {
 
 // COUNT random values with a non-zero leading digit, plus their strings.
 struct Corpus {
-    std::vector<__uint128_t> value;
+    std::vector<fastconv_widest_uint_t> value;
     std::vector<std::string> want;
     mutable std::vector<char> out;
 
@@ -78,7 +78,7 @@ struct Corpus {
         : value(COUNT), want(COUNT), out(COUNT * kStride, '\0') {
         for (unsigned i = 0; i < COUNT; ++i) {
             std::string s;
-            __uint128_t v = 0;
+            fastconv_widest_uint_t v = 0;
             for (unsigned j = 0; j < len; ++j) {
                 const unsigned d = j == 0 ? 1 + Rand() % (radix - 1) : Rand() % radix;
                 s += kDigits[d];
@@ -210,7 +210,7 @@ Cell Measure(const Corpus& corpus, unsigned len, F f) {
 
 template <unsigned R, unsigned L>
 void Row() {
-    if constexpr (requires { v0::int2str<R, L>(nullptr, result_t<R, L>{}); }) {
+    if constexpr (requires { fastconv::int2str<R, L>(nullptr, result_t<R, L>{}); }) {
         const Corpus corpus(R, L);
         TableRow row{R, L, {}};
 
@@ -360,7 +360,12 @@ void PrintHeader(const char* title, int width) {
 
 int main() {
     std::printf("compiler : ");
-#if defined(__clang__)
+#if defined(__clang__) && defined(_MSC_VER)
+    std::printf("clang-cl %d.%d.%d (MSVC ABI %d)", __clang_major__, __clang_minor__,
+                __clang_patchlevel__, _MSC_VER);
+#elif defined(_MSC_VER)
+    std::printf("msvc %d", _MSC_VER);
+#elif defined(__clang__)
     std::printf("clang %d.%d.%d", __clang_major__, __clang_minor__, __clang_patchlevel__);
 #elif defined(__GNUC__)
     std::printf("gcc %d.%d.%d", __GNUC__, __GNUC_MINOR__, __GNUC_PATCHLEVEL__);
@@ -368,9 +373,9 @@ int main() {
     std::printf("unknown");
 #endif
     std::printf("\ntarget   : ");
-#if defined(__x86_64__)
+#if defined(__x86_64__) || defined(_M_X64)
     std::printf("x86-64");
-#elif defined(__aarch64__)
+#elif defined(__aarch64__) || defined(_M_ARM64)
     std::printf("aarch64");
 #else
     std::printf("unknown");
@@ -380,6 +385,7 @@ int main() {
 #else
     std::printf(" (simd namespace DISABLED)");
 #endif
+    std::printf("\nuint128  : %s", FASTCONV_HAS_NATIVE_UINT128 ? "native" : "unavailable");
     std::printf("\nsampling : TRIALS=%d BLOCK=%d (=> %d samples) TARGET_US=%d COUNT=%d\n", TRIALS,
                 BLOCK, TRIALS / BLOCK, TARGET_US, COUNT);
     PrintCpu();
