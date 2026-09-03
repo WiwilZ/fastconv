@@ -1,0 +1,80 @@
+name: Cross-platform benchmarks
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Ubuntu 24.04 x86-64
+            id: ubuntu-24.04-x86-64
+            runner: ubuntu-24.04
+            cpu_flags: -march=native
+          - name: Ubuntu 24.04 arm64
+            id: ubuntu-24.04-arm64
+            runner: ubuntu-24.04-arm
+            cpu_flags: -mcpu=native
+          - name: macOS 15 Intel
+            id: macos-15-x86-64
+            runner: macos-15-intel
+            cpu_flags: -march=native
+          - name: macOS 15 Apple Silicon
+            id: macos-15-arm64
+            runner: macos-15
+            cpu_flags: -mcpu=native
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Record environment
+        shell: bash
+        run: |
+          mkdir -p build results
+          {
+            echo "runner   : ${{ matrix.runner }}"
+            echo "image OS : ${ImageOS:-unknown}"
+            echo "image ver: ${ImageVersion:-unknown}"
+            echo "uname    : $(uname -a)"
+            echo "compiler : $(clang++ --version | head -n 1)"
+            echo "flags    : -std=c++2c -O3 -DNDEBUG ${{ matrix.cpu_flags }}"
+            if command -v lscpu >/dev/null 2>&1; then
+              lscpu
+            elif command -v sysctl >/dev/null 2>&1; then
+              sysctl -n machdep.cpu.brand_string 2>/dev/null || true
+              sysctl -n hw.machine 2>/dev/null || true
+              sysctl -n hw.optional.arm64 2>/dev/null || true
+            fi
+          } | tee results/environment.txt
+
+      - name: Build benchmarks
+        shell: bash
+        run: |
+          clang++ -std=c++2c -O3 -DNDEBUG ${{ matrix.cpu_flags }} benchmark_str2int.cpp -o build/benchmark_str2int
+          clang++ -std=c++2c -O3 -DNDEBUG ${{ matrix.cpu_flags }} benchmark_int2str.cpp -o build/benchmark_int2str
+
+      - name: Run str2int benchmark
+        shell: bash
+        run: build/benchmark_str2int | tee results/benchmark_str2int.txt
+
+      - name: Run int2str benchmark
+        shell: bash
+        run: build/benchmark_int2str | tee results/benchmark_int2str.txt
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fastconv-benchmark-${{ matrix.id }}
+          path: results/
+          if-no-files-found: error
+          retention-days: 30
