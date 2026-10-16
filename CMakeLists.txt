@@ -3,6 +3,8 @@ cmake_minimum_required(VERSION 3.20)
 project(fastconv_benchmarks LANGUAGES CXX)
 
 option(FASTCONV_NATIVE_ARCH "Enable instructions for the runner's native CPU" ON)
+option(FASTCONV_DISABLE_UINT128
+       "Disable compiler-native 128-bit integer support" OFF)
 
 if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
@@ -21,6 +23,10 @@ endforeach()
 function(add_fastconv_benchmark target source)
     add_executable(${target} ${source} int2str.h str2int.h utils.h)
 
+    if(FASTCONV_DISABLE_UINT128)
+        target_compile_definitions(${target} PRIVATE FASTCONV_DISABLE_UINT128=1)
+    endif()
+
     if(FASTCONV_NATIVE_ARCH)
         if(MSVC OR CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
             if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64)$")
@@ -36,3 +42,6 @@ endfunction()
 
 add_fastconv_benchmark(benchmark_str2int benchmark_str2int.cpp)
 add_fastconv_benchmark(benchmark_int2str benchmark_int2str.cpp)
+add_fastconv_benchmark(fastconv_smoke fastconv_smoke.cpp)
+add_fastconv_benchmark(fastconv_smoke_no128 fastconv_smoke.cpp)
+target_compile_definitions(fastconv_smoke_no128 PRIVATE FASTCONV_DISABLE_UINT128=1)

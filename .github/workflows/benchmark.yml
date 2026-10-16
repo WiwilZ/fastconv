@@ -7,6 +7,7 @@ on:
     paths:
       - "*.h"
       - "benchmark_*.cpp"
+      - "fastconv_smoke.cpp"
       - "CMakeLists.txt"
       - ".github/workflows/benchmark.yml"
 
@@ -70,6 +71,7 @@ jobs:
       - name: Record environment
         shell: bash
         run: |
+          set -o pipefail
           mkdir -p results
           {
             echo "runner   : ${{ matrix.runner }}"
@@ -94,16 +96,20 @@ jobs:
       - name: Configure
         shell: bash
         run: |
+          set -o pipefail
           cmake -S . -B build -DFASTCONV_NATIVE_ARCH=ON \
             ${{ matrix.cmake_args }} 2>&1 | tee results/configure.txt
 
       - name: Build benchmarks
         shell: bash
-        run: cmake --build build --config Release --parallel 1 2>&1 | tee results/build.txt
+        run: |
+          set -o pipefail
+          cmake --build build --config Release --parallel 1 2>&1 | tee results/build.txt
 
       - name: Run str2int benchmark
         shell: bash
         run: |
+          set -o pipefail
           executable=build/bin/benchmark_str2int
           [[ "$RUNNER_OS" == "Windows" ]] && executable="${executable}.exe"
           "$executable" | tee results/benchmark_str2int.txt
@@ -111,9 +117,64 @@ jobs:
       - name: Run int2str benchmark
         shell: bash
         run: |
+          set -o pipefail
           executable=build/bin/benchmark_int2str
           [[ "$RUNNER_OS" == "Windows" ]] && executable="${executable}.exe"
           "$executable" | tee results/benchmark_int2str.txt
+
+      - name: Configure no-native build
+        shell: bash
+        run: |
+          set -o pipefail
+          cmake -S . -B build-no128 -DFASTCONV_NATIVE_ARCH=ON \
+            -DFASTCONV_DISABLE_UINT128=ON \
+            ${{ matrix.cmake_args }} 2>&1 | tee results/configure-no128.txt
+
+      - name: Build no-native benchmarks
+        shell: bash
+        run: |
+          set -o pipefail
+          cmake --build build-no128 --config Release --parallel 1 2>&1 | tee results/build-no128.txt
+
+      - name: Run no-native str2int benchmark
+        shell: bash
+        run: |
+          set -o pipefail
+          executable=build-no128/bin/benchmark_str2int
+          [[ "$RUNNER_OS" == "Windows" ]] && executable="${executable}.exe"
+          "$executable" | tee results/benchmark_str2int-no128.txt
+
+      - name: Run no-native int2str benchmark
+        shell: bash
+        run: |
+          set -o pipefail
+          executable=build-no128/bin/benchmark_int2str
+          [[ "$RUNNER_OS" == "Windows" ]] && executable="${executable}.exe"
+          "$executable" | tee results/benchmark_int2str-no128.txt
+
+      - name: Run native and no-native portability smoke tests
+        shell: bash
+        run: |
+          set -o pipefail
+          smoke=build/bin/fastconv_smoke
+          smoke_forced_no128=build/bin/fastconv_smoke_no128
+          smoke_no128=build-no128/bin/fastconv_smoke
+          [[ "$RUNNER_OS" == "Windows" ]] && smoke="${smoke}.exe" && smoke_forced_no128="${smoke_forced_no128}.exe" && smoke_no128="${smoke_no128}.exe"
+          "$smoke"
+          "$smoke_forced_no128"
+          "$smoke_no128"
+
+      - name: Check no-native binary for 128-bit arithmetic helpers
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -o pipefail
+          for binary in build/bin/fastconv_smoke_no128 build-no128/bin/fastconv_smoke; do
+            if nm -u "$binary" | grep -E 'ashlti3|ashrti3|lshrti3|multi3|udivti3|umodti3|divti3|modti3|cmpti2|ucmpti2'; then
+              echo "unexpected compiler-emitted 128-bit arithmetic helper in $binary"
+              exit 1
+            fi
+          done
 
       - name: Upload benchmark results
         if: always()

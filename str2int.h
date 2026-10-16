@@ -2,9 +2,11 @@
 
 #include "utils.h"
 
+#include <bit>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 
 
 
@@ -408,18 +410,71 @@ constexpr result_t<Radix, Len> str2int(const char* str) noexcept {
 // ============================================================================
 namespace fastconv {
 
-template <std::integral T>
-constexpr T str2int_fallback(const char* str, std::size_t len, unsigned radix) noexcept {
-    T value = 0;
+namespace fastconv_str2int_detail {
+
+template <typename T>
+using unsigned_integer_t = fastconv_unsigned_t<T>;
+
+constexpr unsigned DecodeDigit(unsigned c) noexcept {
+    return c <= static_cast<unsigned>('9')
+               ? c - static_cast<unsigned>('0')
+               : (c | 0x20u) - static_cast<unsigned>('a') + 10;
+}
+
+template <typename U>
+    requires FastconvUnsignedInteger<U>
+constexpr U ParseUnsignedFallback(const char* str, std::size_t len,
+                                  unsigned radix) noexcept {
+    U value = 0;
     for (std::size_t i = 0; i < len; ++i) {
         const unsigned c = static_cast<unsigned char>(str[i]);
-        const unsigned digit =
-            c <= static_cast<unsigned>('9')
-                ? c - static_cast<unsigned>('0')
-                : (c | 0x20u) - static_cast<unsigned>('a') + 10;
-        value = static_cast<T>(value * radix + digit);
+        value = static_cast<U>(value * static_cast<U>(radix) +
+                               static_cast<U>(DecodeDigit(c)));
     }
     return value;
+}
+
+template <typename T>
+    requires FastconvSignedInteger<T>
+constexpr T FromUnsignedBits(unsigned_integer_t<T> bits) noexcept {
+    // The supported platforms use two's-complement signed integers. bit_cast
+    // makes modulo parsing well-defined at the language level and handles the
+    // minimum signed value without an overflowing unary minus.
+    return std::bit_cast<T>(bits);
+}
+
+}  // namespace fastconv_str2int_detail
+
+template <FastconvInteger T>
+constexpr T str2int_fallback(const char* str, std::size_t len, unsigned radix) noexcept {
+    if (!IsValidRadix(radix)) {
+        return 0;
+    }
+
+    if constexpr (std::same_as<std::remove_cv_t<T>, bool>) {
+        bool value = false;
+        for (std::size_t i = 0; i < len; ++i) {
+            const unsigned c = static_cast<unsigned char>(str[i]);
+            value = static_cast<bool>(value * radix +
+                                      fastconv_str2int_detail::DecodeDigit(c));
+        }
+        return value;
+    } else if constexpr (FastconvIsSigned<T>) {
+        bool negative = false;
+        if (len != 0 && (str[0] == '-' || str[0] == '+')) {
+            negative = str[0] == '-';
+            ++str;
+            --len;
+        }
+        using U = fastconv_str2int_detail::unsigned_integer_t<T>;
+        U value = fastconv_str2int_detail::ParseUnsignedFallback<U>(str, len, radix);
+        if (negative) {
+            value = static_cast<U>(U(0) - value);
+        }
+        return fastconv_str2int_detail::FromUnsignedBits<T>(value);
+    } else {
+        return fastconv_str2int_detail::ParseUnsignedFallback<T>(str, len, radix);
+    }
 }
 
 /*----------------------------------------2----------------------------------------*/
@@ -440,7 +495,8 @@ constexpr uint8_t str2int(const char* str) noexcept {
 template <unsigned Radix, unsigned Len>
     requires (Radix == 2 && Len == 16)
 constexpr uint16_t str2int(const char* str) noexcept {
-    return static_cast<uint16_t>(str2int<2, 8>(str)) << 8 | str2int<2, 8>(str + 8);
+    return static_cast<uint16_t>(
+        static_cast<uint16_t>(str2int<2, 8>(str)) << 8 | str2int<2, 8>(str + 8));
 }
 
 template <unsigned Radix, unsigned Len>
@@ -732,24 +788,140 @@ constexpr result_t<Radix, Len> str2int(const char* str) noexcept {
 }
 /*----------------------------------------[17, 31]U[33, 36]----------------------------------------*/
 
-template <unsigned Radix, unsigned Len, std::integral T>
+// Parse an arbitrary-length field in eight-character blocks. The working type
+// is at least uint64_t so radix^8 is always representable; narrower results
+// retain the fallback's modulo semantics at the final cast. Native uint128 is
+// used only when T itself is wider than 64 bits.
+template <unsigned Radix, FastconvInteger T>
+    requires (IsValidRadix(Radix) && FastconvUnsignedInteger<T>)
+constexpr T str2int_chunked(const char* str, std::size_t len) noexcept {
+    using U = fastconv_str2int_detail::unsigned_integer_t<T>;
+    using W = std::conditional_t<(sizeof(U) < sizeof(uint64_t)), uint64_t, U>;
+    if (len == 0) {
+        return 0;
+    }
+
+    constexpr W kGroup = Pow<W>(Radix, 8);
+    std::size_t leading_len = len & 7u;
+    if (leading_len == 0) {
+        leading_len = 8;
+    }
+
+    W value = 0;
+    if (leading_len == 8) {
+        value = static_cast<W>(str2int<Radix, 8>(str));
+    } else {
+        for (std::size_t i = 0; i < leading_len; ++i) {
+            value = static_cast<W>(
+                value * static_cast<W>(Radix) +
+                static_cast<W>(fastconv_str2int_detail::DecodeDigit(
+                    static_cast<unsigned char>(str[i]))));
+        }
+    }
+    for (std::size_t i = leading_len; i < len; i += 8) {
+        value = static_cast<W>(
+            value * kGroup + static_cast<W>(str2int<Radix, 8>(str + i)));
+    }
+    return static_cast<T>(value);
+}
+
+template <unsigned Radix, unsigned Len, FastconvInteger T>
 constexpr T str2int_padded(const char* str, std::size_t len) noexcept {
-    if constexpr (requires { str2int<Radix, Len>(str); }) {
+    // Keep this helper well-defined even when called outside the dispatcher's
+    // `len <= Len` proof.  Besides avoiding size_t underflow, the explicit
+    // branch prevents GCC's range checker from diagnosing the guarded copy
+    // after recursive runtime-radix inlining.
+    if (len > Len) {
+        return str2int_fallback<T>(str, len, Radix);
+    }
+    // Keep <=64-bit runtime conversions on <=64-bit arithmetic even on
+    // compilers that expose a native uint128 type. Wider fixed-width buckets
+    // otherwise make the same API substantially slower and non-portable.
+    if constexpr ((BitsNeeded(Radix, Len) <= 64 ||
+                   sizeof(T) > sizeof(uint64_t)) &&
+                  requires { str2int<Radix, Len>(str); }) {
         char padded[Len];
         const std::size_t padding = Len - len;
-        for (std::size_t i = 0; i < padding; ++i) {
-            padded[i] = '0';
-        }
-        for (std::size_t i = 0; i < len; ++i) {
-            padded[padding + i] = str[i];
+        // One bounded loop makes the source index obviously non-negative and
+        // keeps GCC's object-size analysis from treating the two-loop copy as
+        // an unconstrained `padding + i` expression after inlining.
+        for (std::size_t i = 0; i < Len; ++i) {
+            padded[i] = i < padding ? '0' : str[i - padding];
         }
         return static_cast<T>(str2int<Radix, Len>(padded));
+    } else if constexpr (FastconvUnsignedInteger<T>) {
+        return str2int_chunked<Radix, T>(str, len);
     } else {
         return str2int_fallback<T>(str, len, Radix);
     }
 }
 
-template <unsigned Radix, std::integral T>
+// Parse a decimal field in eight-digit chunks.  The leading chunk is kept
+// unpadded so the runtime facade never has to materialize a temporary padded
+// buffer.  Every operation is intentionally uint64_t arithmetic: for a
+// narrower destination the final cast has the same modulo result as the
+// scalar fallback, while no-native builds avoid a hidden wide-integer helper.
+constexpr uint64_t ParseDecimalPrefix(const char* str, std::size_t len) noexcept {
+    switch (len) {
+        case 0:
+            return 0;
+        case 1:
+            return static_cast<unsigned>(str[0] - '0');
+        case 2:
+            return static_cast<unsigned>(str[0] - '0') * 10u +
+                   static_cast<unsigned>(str[1] - '0');
+        case 3:
+            return static_cast<unsigned>(str[0] - '0') * 100u +
+                   static_cast<unsigned>(str[1] - '0') * 10u +
+                   static_cast<unsigned>(str[2] - '0');
+        case 4:
+            return static_cast<unsigned>(str[0] - '0') * 1000u +
+                   static_cast<unsigned>(str[1] - '0') * 100u +
+                   static_cast<unsigned>(str[2] - '0') * 10u +
+                   static_cast<unsigned>(str[3] - '0');
+        case 5:
+            return static_cast<unsigned>(str[0] - '0') * 10000u +
+                   static_cast<unsigned>(str[1] - '0') * 1000u +
+                   static_cast<unsigned>(str[2] - '0') * 100u +
+                   static_cast<unsigned>(str[3] - '0') * 10u +
+                   static_cast<unsigned>(str[4] - '0');
+        case 6:
+            return static_cast<unsigned>(str[0] - '0') * 100000u +
+                   static_cast<unsigned>(str[1] - '0') * 10000u +
+                   static_cast<unsigned>(str[2] - '0') * 1000u +
+                   static_cast<unsigned>(str[3] - '0') * 100u +
+                   static_cast<unsigned>(str[4] - '0') * 10u +
+                   static_cast<unsigned>(str[5] - '0');
+        case 7:
+            return static_cast<unsigned>(str[0] - '0') * 1000000u +
+                   static_cast<unsigned>(str[1] - '0') * 100000u +
+                   static_cast<unsigned>(str[2] - '0') * 10000u +
+                   static_cast<unsigned>(str[3] - '0') * 1000u +
+                   static_cast<unsigned>(str[4] - '0') * 100u +
+                   static_cast<unsigned>(str[5] - '0') * 10u +
+                   static_cast<unsigned>(str[6] - '0');
+        default:
+            return str2int<10, 8>(str);
+    }
+}
+
+constexpr uint64_t Str2intDecimalUint64(const char* str, std::size_t len) noexcept {
+    if (len == 0) {
+        return 0;
+    }
+    std::size_t leading_len = len & 7u;
+    if (leading_len == 0) {
+        leading_len = 8;
+    }
+
+    uint64_t value = ParseDecimalPrefix(str, leading_len);
+    for (std::size_t i = leading_len; i < len; i += 8) {
+        value = value * 100000000ull + str2int<10, 8>(str + i);
+    }
+    return value;
+}
+
+template <unsigned Radix, FastconvInteger T>
 constexpr T str2int_dispatch_len(const char* str, std::size_t len) noexcept {
     if (len <= 4) {
         return str2int_padded<Radix, 4, T>(str, len);
@@ -769,10 +941,14 @@ constexpr T str2int_dispatch_len(const char* str, std::size_t len) noexcept {
     if (len <= 128) {
         return str2int_padded<Radix, 128, T>(str, len);
     }
-    return str2int_fallback<T>(str, len, Radix);
+    if constexpr (FastconvUnsignedInteger<T>) {
+        return str2int_chunked<Radix, T>(str, len);
+    } else {
+        return str2int_fallback<T>(str, len, Radix);
+    }
 }
 
-template <unsigned Radix = 2, std::integral T>
+template <unsigned Radix = 2, FastconvInteger T>
 constexpr T str2int_dispatch_radix(
     const char* str, std::size_t len, unsigned radix) noexcept {
     if (radix == Radix) {
@@ -787,8 +963,32 @@ constexpr T str2int_dispatch_radix(
 // Runtime dispatch facade. Inputs shorter than four characters use Horner
 // directly. Longer inputs are left-padded with zeroes to the next supported
 // power-of-two length and forwarded to the corresponding specialization.
-template <std::integral T>
+template <FastconvInteger T>
 constexpr T str2int(const char* str, std::size_t len, unsigned radix) noexcept {
+    if (!IsValidRadix(radix)) {
+        return 0;
+    }
+
+    if constexpr (FastconvIsSigned<T>) {
+        bool negative = false;
+        if (len != 0 && (str[0] == '-' || str[0] == '+')) {
+            negative = str[0] == '-';
+            ++str;
+            --len;
+        }
+        using U = fastconv_str2int_detail::unsigned_integer_t<T>;
+        U value = str2int<U>(str, len, radix);
+        if (negative) {
+            value = static_cast<U>(U(0) - value);
+        }
+        return fastconv_str2int_detail::FromUnsignedBits<T>(value);
+    }
+
+    if constexpr (FastconvUnsignedInteger<T> && sizeof(T) <= sizeof(uint64_t)) {
+        if (radix == 10) {
+            return static_cast<T>(Str2intDecimalUint64(str, len));
+        }
+    }
     if (len < 4) {
         return str2int_fallback<T>(str, len, radix);
     }
@@ -877,7 +1077,11 @@ constexpr result_t<Radix, Len> str2int(const char* str) noexcept {
 #if defined(FASTCONV_X86_SIMD)
 #include <immintrin.h>
 #else
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <arm64_neon.h>
+#else
 #include <arm_neon.h>
+#endif
 #endif
 
 // ============================================================================
@@ -896,9 +1100,9 @@ constexpr result_t<Radix, Len> str2int(const char* str) noexcept {
 // ============================================================================
 namespace simd {
 
-#if defined(__AVX512BW__)
+#if defined(FASTCONV_X86_AVX512BW)
 constexpr unsigned kBlock = 64;
-#elif defined(__AVX2__)
+#elif defined(FASTCONV_X86_AVX2)
 constexpr unsigned kBlock = 32;
 #else
 constexpr unsigned kBlock = 16;
@@ -955,7 +1159,7 @@ inline void Halves16(const char* str, uint64_t* out) noexcept {
 #endif
 }
 
-#if defined(__AVX2__)
+#if defined(FASTCONV_X86_AVX2)
 // out[0 .. 3], most significant first. maddubs / madd stay inside their 128-bit
 // lanes, and mul_epu32 pairs adjacent 32-bit lanes, so the global character
 // order is preserved throughout.
@@ -988,7 +1192,7 @@ inline void Halves32(const char* str, uint64_t* out) noexcept {
 }
 #endif
 
-#if defined(__AVX512BW__)
+#if defined(FASTCONV_X86_AVX512BW)
 // out[0 .. 7], most significant first.
 template <unsigned Radix>
 inline void Halves64(const char* str, uint64_t* out) noexcept {
@@ -1024,12 +1228,17 @@ inline void Blocks(const char* str, uint64_t* out) noexcept {
 
     for (unsigned i = 0; i < Len / kPass; ++i) {
         if constexpr (kPass == 64) {
-#if defined(__AVX512BW__)
+#if defined(FASTCONV_X86_AVX512BW)
             Halves64<Radix>(str + i * kPass, out + i * 8);
 #endif
         } else if constexpr (kPass == 32) {
-#if defined(__AVX2__)
+#if defined(FASTCONV_X86_AVX2)
             Halves32<Radix>(str + i * kPass, out + i * 4);
+#else
+            // AVX512BW normally implies AVX2, but keep unusual feature
+            // combinations correct when AVX2 is explicitly disabled.
+            Halves16<Radix>(str + i * kPass, out + i * 4);
+            Halves16<Radix>(str + i * kPass + 16, out + i * 4 + 2);
 #endif
         } else {
             Halves16<Radix>(str + i * kPass, out + i * 2);

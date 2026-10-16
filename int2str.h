@@ -2,6 +2,7 @@
 
 #include "utils.h"
 
+#include <bit>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
@@ -95,6 +96,42 @@ struct Pairs {
 template <unsigned Radix>
 constexpr Pairs<Radix> kPairs{};
 
+#if defined(__x86_64__) || defined(_M_X64)
+// Scalar decimal blocks use the same 4-digit parallel reduction as Abseil.
+// On x86-64 this avoids the pair-table loads; ARM64 measurements favor the
+// table path below. The arithmetic is endian-neutral because Store writes the
+// packed bytes.
+namespace fastconv_detail {
+
+constexpr uint64_t PrepareDecimalEight(uint32_t value) noexcept {
+    constexpr uint64_t kDiv100Mul = 10486;
+    constexpr uint64_t kDiv10Mul = 103;
+    const uint32_t high = value / 10000;
+    const uint32_t low = value - high * 10000;
+    const uint64_t merged = uint64_t(high) | (uint64_t(low) << 32);
+    const uint64_t div100 = ((merged * kDiv100Mul) >> 20) &
+                            ((uint64_t(0x7f) << 32) | 0x7f);
+    const uint64_t mod100 = merged - 100 * div100;
+    const uint64_t hundreds = (mod100 << 16) + div100;
+    uint64_t tens = (hundreds * kDiv10Mul) >> 10;
+    tens &= (uint64_t(0xf) << 48) | (uint64_t(0xf) << 32) |
+            (uint64_t(0xf) << 16) | 0xf;
+    tens += (hundreds - 10 * tens) << 8;
+    return tens;
+}
+
+constexpr void Decimal16Scalar(char* out, uint64_t value) noexcept {
+    constexpr uint64_t kBase = 100000000;
+    const uint32_t high = static_cast<uint32_t>(value / kBase);
+    const uint32_t low = static_cast<uint32_t>(value - uint64_t(high) * kBase);
+    constexpr uint64_t kZero = 0x3030303030303030ull;
+    Store<uint64_t>(out, PrepareDecimalEight(high) + kZero);
+    Store<uint64_t>(out + 8, PrepareDecimalEight(low) + kZero);
+}
+
+}  // namespace fastconv_detail
+#endif
+
 // Four-digit tables stay reasonably small only for these radices: 324 bytes
 // for radix 3, then 2500, 5184, and 9604 bytes for radices 5, 6, and 7.
 template <unsigned Radix>
@@ -130,6 +167,139 @@ inline constexpr Quads<Radix> kQuads{};
 
 template <unsigned Radix>
 concept Pow2Radix = Radix == 2 || Radix == 4 || Radix == 8 || Radix == 16 || Radix == 32;
+
+#if FASTCONV_HAS_NATIVE_UINT128
+// A reciprocal at the width of the full value gives a quotient that is exact
+// or one too high.  The supported splits cover the fixed-width cases
+// where the divisor is at most 64 bits but the dividend is wider than 64 bits:
+// 64 digits as two 32-digit blocks for radix 3, 32 digits as two 16-digit
+// blocks, and 16 digits as two 8-digit blocks.
+template <unsigned Radix, unsigned Digits, unsigned Chunk>
+concept ReciprocalSplit =
+    !Pow2Radix<Radix> && Digits == 2 * Chunk &&
+    BitsNeeded(Radix, Digits) > 64 && BitsNeeded(Radix, Digits) < 128 &&
+    BitsNeeded(Radix, Chunk) <= 64;
+
+namespace fastconv_detail {
+
+template <unsigned Radix, unsigned Digits, unsigned Chunk>
+    requires ReciprocalSplit<Radix, Digits, Chunk>
+inline constexpr unsigned kReciprocalPrecision = BitsNeeded(Radix, Digits);
+
+template <unsigned Radix, unsigned Digits, unsigned Chunk>
+    requires ReciprocalSplit<Radix, Digits, Chunk>
+inline constexpr fastconv_uint128_t kReciprocalBase =
+    Pow<fastconv_uint128_t>(Radix, Chunk);
+
+template <unsigned Radix, unsigned Digits, unsigned Chunk>
+    requires ReciprocalSplit<Radix, Digits, Chunk>
+inline constexpr fastconv_uint128_t kReciprocalMagicValue =
+    (static_cast<fastconv_uint128_t>(1) << kReciprocalPrecision<Radix, Digits, Chunk>) /
+        kReciprocalBase<Radix, Digits, Chunk> +
+    (((static_cast<fastconv_uint128_t>(1) <<
+       kReciprocalPrecision<Radix, Digits, Chunk>) %
+      kReciprocalBase<Radix, Digits, Chunk>) != 0);
+
+template <unsigned Radix, unsigned Digits, unsigned Chunk>
+    requires ReciprocalSplit<Radix, Digits, Chunk>
+inline constexpr uint64_t kReciprocalMagic = [] {
+    constexpr fastconv_uint128_t magic =
+        kReciprocalMagicValue<Radix, Digits, Chunk>;
+    static_assert(magic <= static_cast<fastconv_uint128_t>(
+                              std::numeric_limits<uint64_t>::max()));
+    return static_cast<uint64_t>(magic);
+}();
+
+// For some splits the reciprocal product is known to fit in 64 bits.  Keeping
+// that intermediate narrow lets the compiler use one low-half multiply and one
+// multiply-add instead of constructing a full 128-bit sum.  The bound is exact:
+// high < 2^H and the high half of low * magic is below magic, so their sum is
+// below 2^H * magic.
+template <unsigned Radix, unsigned Digits, unsigned Chunk>
+concept NarrowReciprocal =
+    ReciprocalSplit<Radix, Digits, Chunk> &&
+    (kReciprocalPrecision<Radix, Digits, Chunk> - 64) +
+            std::bit_width(kReciprocalMagic<Radix, Digits, Chunk>) <=
+        64;
+
+// Return the quotient and remainder together so callers do not repeat the
+// wide product needed to correct the reciprocal estimate.
+struct ReciprocalParts {
+    uint64_t quotient;
+    uint64_t remainder;
+};
+
+template <unsigned Radix, unsigned Digits, unsigned Chunk>
+    requires ReciprocalSplit<Radix, Digits, Chunk>
+constexpr ReciprocalParts ReciprocalDivide(fastconv_uint128_t value) noexcept {
+    constexpr unsigned kPrecision = kReciprocalPrecision<Radix, Digits, Chunk>;
+    constexpr unsigned kShift = kPrecision - 64;
+    constexpr uint64_t kMagic = kReciprocalMagic<Radix, Digits, Chunk>;
+    uint64_t estimate;
+    if constexpr (NarrowReciprocal<Radix, Digits, Chunk>) {
+        const uint64_t high = static_cast<uint64_t>(value >> 64);
+        const uint64_t low = static_cast<uint64_t>(value);
+        const uint64_t scaled =
+            high * kMagic +
+            static_cast<uint64_t>(
+                (static_cast<fastconv_uint128_t>(low) * kMagic) >> 64);
+        estimate = scaled >> kShift;
+    } else {
+        const fastconv_uint128_t scaled =
+            static_cast<fastconv_uint128_t>(static_cast<uint64_t>(value >> 64)) * kMagic +
+            (static_cast<fastconv_uint128_t>(static_cast<uint64_t>(value)) * kMagic >> 64);
+        estimate = static_cast<uint64_t>(scaled >> kShift);
+    }
+    constexpr fastconv_uint128_t kBase = kReciprocalBase<Radix, Digits, Chunk>;
+    const fastconv_uint128_t product = static_cast<fastconv_uint128_t>(estimate) * kBase;
+    const uint64_t too_high = static_cast<unsigned>(product > value);
+    return {estimate - too_high,
+            static_cast<uint64_t>(value - product +
+                                  static_cast<fastconv_uint128_t>(too_high) * kBase)};
+}
+
+template <unsigned Radix, unsigned Digits, unsigned Chunk>
+    requires ReciprocalSplit<Radix, Digits, Chunk>
+constexpr uint64_t ReciprocalHigh(fastconv_uint128_t value) noexcept {
+    return ReciprocalDivide<Radix, Digits, Chunk>(value).quotient;
+}
+
+static_assert(kReciprocalMagic<10, 32, 16> == 16225927682921337ull);
+static_assert(kReciprocalBase<10, 32, 16> ==
+              static_cast<fastconv_uint128_t>(10000000000000000ull));
+static_assert(kReciprocalMagicValue<36, 16, 8> <=
+              static_cast<fastconv_uint128_t>(std::numeric_limits<uint64_t>::max()));
+static_assert(NarrowReciprocal<5, 32, 16>);
+static_assert(NarrowReciprocal<6, 32, 16>);
+static_assert(NarrowReciprocal<17, 16, 8>);
+static_assert(NarrowReciprocal<36, 16, 8>);
+static_assert(!NarrowReciprocal<3, 64, 32>);
+static_assert(!NarrowReciprocal<10, 32, 16>);
+
+template <unsigned Radix, unsigned Digits, unsigned Chunk>
+    requires ReciprocalSplit<Radix, Digits, Chunk>
+constexpr bool ReciprocalCheck(fastconv_uint128_t value, uint64_t expected) noexcept {
+    return ReciprocalHigh<Radix, Digits, Chunk>(value) == expected;
+}
+
+static_assert(ReciprocalCheck<10, 32, 16>(0, 0));
+static_assert(ReciprocalCheck<10, 32, 16>(kReciprocalBase<10, 32, 16> - 1, 0));
+static_assert(ReciprocalCheck<10, 32, 16>(kReciprocalBase<10, 32, 16>, 1));
+static_assert(ReciprocalCheck<10, 32, 16>(
+    static_cast<fastconv_uint128_t>(354) * kReciprocalBase<10, 32, 16> - 1, 353));
+static_assert(ReciprocalCheck<10, 32, 16>(
+    static_cast<fastconv_uint128_t>(kReciprocalBase<10, 32, 16>) *
+        kReciprocalBase<10, 32, 16> - 1,
+    9999999999999999ull));
+static_assert(ReciprocalCheck<3, 64, 32>(0, 0));
+static_assert(ReciprocalCheck<3, 64, 32>(kReciprocalBase<3, 64, 32> - 1, 0));
+static_assert(ReciprocalCheck<3, 64, 32>(kReciprocalBase<3, 64, 32>, 1));
+static_assert(ReciprocalCheck<36, 16, 8>(0, 0));
+static_assert(ReciprocalCheck<36, 16, 8>(kReciprocalBase<36, 16, 8> - 1, 0));
+static_assert(ReciprocalCheck<36, 16, 8>(kReciprocalBase<36, 16, 8>, 1));
+
+}  // namespace fastconv_detail
+#endif
 
 
 // ============================================================================
@@ -205,19 +375,125 @@ constexpr void int2str(char* out, result_t<Radix, Len> value) noexcept {
 // ============================================================================
 namespace fastconv {
 
-template <std::integral T>
+namespace fastconv_runtime_detail {
+
+template <typename T>
+using unsigned_integer_t = fastconv_unsigned_t<T>;
+
+// Converting through the corresponding unsigned type makes the absolute value
+// of the most-negative signed value representable without signed overflow.
+template <typename T>
+    requires (!std::same_as<std::remove_cv_t<T>, bool>)
+constexpr unsigned_integer_t<T> UnsignedMagnitude(T value) noexcept {
+    using U = unsigned_integer_t<T>;
+    const U bits = static_cast<U>(value);
+    if constexpr (FastconvIsSigned<T>) {
+        return value < 0 ? U(0) - bits : bits;
+    } else {
+        return bits;
+    }
+}
+
+template <typename U>
+    requires FastconvUnsignedInteger<U>
+constexpr unsigned UnsignedBitWidth(U value) noexcept {
+    if constexpr (sizeof(U) <= sizeof(uint64_t)) {
+        return static_cast<unsigned>(std::bit_width(static_cast<uint64_t>(value)));
+    } else {
+        const uint64_t high = static_cast<uint64_t>(value >> 64);
+        return high ? 64u + static_cast<unsigned>(std::bit_width(high))
+                    : static_cast<unsigned>(
+                          std::bit_width(static_cast<uint64_t>(value)));
+    }
+}
+
+template <typename U>
+    requires FastconvUnsignedInteger<U>
+constexpr std::size_t RuntimeDigitCount(U value, unsigned radix) noexcept {
+    if (value == 0) {
+        return 1;
+    }
+    if ((radix & (radix - 1)) == 0) {
+        unsigned radix_bits = 0;
+        for (unsigned r = radix; r > 1; r >>= 1) {
+            ++radix_bits;
+        }
+        const unsigned value_bits = UnsignedBitWidth(value);
+        return (value_bits + radix_bits - 1) / radix_bits;
+    }
+
+    // A runtime radix cannot be strength-reduced to a reciprocal.  Divide by
+    // a small power of the radix instead, so the expensive variable divide is
+    // paid once per group rather than once per output digit.  The group size
+    // is chosen to keep radix^group representable in U on every supported
+    // width (radix^8 fits in 64 bits for radix <= 36).
+    constexpr unsigned kGroup = sizeof(U) >= 8 ? 8 :
+                                sizeof(U) >= 4 ? 4 :
+                                sizeof(U) >= 2 ? 2 : 1;
+    const U base = static_cast<U>(radix);
+    std::size_t digits = 1;
+    if constexpr (kGroup > 1) {
+        // For short values the setup multiplies cost more than the divisions
+        // it could save.  The threshold scales with the operand width and is
+        // deliberately conservative; values below it use the small scalar
+        // loop below without even constructing group_base.
+        constexpr unsigned kThresholdBits = sizeof(U) >= 8 ? 24 :
+                                             sizeof(U) >= 4 ? 16 : 8;
+        if (value >= (static_cast<U>(1) << kThresholdBits)) {
+            U group_base = base;
+            const U square = static_cast<U>(base * base);
+            if constexpr (kGroup == 2) {
+                group_base = square;
+            } else {
+                const U fourth = static_cast<U>(square * square);
+                if constexpr (kGroup == 4) {
+                    group_base = fourth;
+                } else {
+                    group_base = static_cast<U>(fourth * fourth);
+                }
+            }
+            while (value >= group_base) {
+                value = static_cast<U>(value / group_base);
+                digits += kGroup;
+            }
+        }
+    }
+    while (value >= base) {
+        value = static_cast<U>(value / base);
+        ++digits;
+    }
+    return digits;
+}
+
+}  // namespace fastconv_runtime_detail
+
+template <FastconvInteger T>
 constexpr std::size_t int2str_fallback(char* out, T value, unsigned radix) noexcept {
+    if (!IsValidRadix(radix)) {
+        return 0;
+    }
     if constexpr (std::same_as<std::remove_cv_t<T>, bool>) {
         out[0] = static_cast<char>('0' + value);
         return 1;
     } else {
-        char reversed[std::numeric_limits<T>::digits + (std::is_signed_v<T> ? 1 : 0)];
+        using U = fastconv_runtime_detail::unsigned_integer_t<T>;
+        if constexpr (FastconvIsSigned<T>) {
+            if (value < 0) {
+                out[0] = '-';
+                return 1 + int2str_fallback(
+                               out + 1,
+                               fastconv_runtime_detail::UnsignedMagnitude(value), radix);
+            }
+        }
+
+        char reversed[std::numeric_limits<U>::digits];
         std::size_t len = 0;
+        U remaining = fastconv_runtime_detail::UnsignedMagnitude(value);
         do {
-            const unsigned digit = static_cast<unsigned>(value % radix);
+            const unsigned digit = static_cast<unsigned>(remaining % static_cast<U>(radix));
             reversed[len++] = DigitChar(digit);
-            value = static_cast<T>(value / radix);
-        } while (value != 0);
+            remaining = static_cast<U>(remaining / static_cast<U>(radix));
+        } while (remaining != 0);
 
         for (std::size_t i = 0; i < len; ++i) {
             out[i] = reversed[len - 1 - i];
@@ -256,6 +532,26 @@ constexpr void int2str(char* out, result_t<Radix, Len> value) noexcept {
 template <unsigned Radix, unsigned Len>
     requires (MulRadix<Radix> && BitsNeeded(Radix, Len) <= kFastconvMaxBits)
 constexpr void int2str(char* out, result_t<Radix, Len> value) noexcept {
+#if defined(__x86_64__) || defined(_M_X64)
+    if constexpr (Radix == 10 && Len == 16) {
+        fastconv_detail::Decimal16Scalar(out, static_cast<uint64_t>(value));
+    } else
+#endif
+#if FASTCONV_HAS_NATIVE_UINT128
+    if constexpr (Len == 64 && ReciprocalSplit<Radix, 64, 32>) {
+        const auto parts = fastconv_detail::ReciprocalDivide<Radix, 64, 32>(value);
+        int2str<Radix, 32>(out, parts.quotient);
+        int2str<Radix, 32>(out + 32, parts.remainder);
+    } else if constexpr (Len == 32 && ReciprocalSplit<Radix, 32, 16>) {
+        const auto parts = fastconv_detail::ReciprocalDivide<Radix, 32, 16>(value);
+        int2str<Radix, 16>(out, parts.quotient);
+        int2str<Radix, 16>(out + 16, parts.remainder);
+    } else if constexpr (Len == 16 && ReciprocalSplit<Radix, 16, 8>) {
+        const auto parts = fastconv_detail::ReciprocalDivide<Radix, 16, 8>(value);
+        int2str<Radix, 8>(out, parts.quotient);
+        int2str<Radix, 8>(out + 8, parts.remainder);
+    } else
+#endif
     if constexpr (Len == 1) {
         out[0] = DigitChar(static_cast<unsigned>(value));
     } else if constexpr (Len == 2) {
@@ -276,10 +572,115 @@ constexpr void int2str(char* out, result_t<Radix, Len> value) noexcept {
     }
 }
 
-template <unsigned Radix, unsigned Len, std::integral T>
+// Runtime uint64_t values can need 17 to 20 decimal digits.  Routing those
+// values through the 32-digit result_t specialization needlessly promotes the
+// operation to native uint128 (and falls back to a long serial loop when
+// native uint128 is unavailable).  Three bounded 64-bit chunks cover the full
+// uint64_t range: an unpadded leading chunk followed by two eight-digit chunks.
+namespace fastconv_detail {
+
+template <unsigned Len>
+constexpr std::size_t WriteDecimalSmall(char* out, uint64_t value) noexcept {
+    static_assert(Len >= 1 && Len <= 8);
+    if constexpr (Len == 1) {
+        int2str<10, 1>(out, static_cast<uint8_t>(value));
+    } else if constexpr (Len == 2) {
+        int2str<10, 2>(out, static_cast<uint8_t>(value));
+    } else if constexpr (Len == 3) {
+        int2str<10, 3>(out, static_cast<uint16_t>(value));
+    } else if constexpr (Len == 4) {
+        int2str<10, 4>(out, static_cast<uint16_t>(value));
+    } else if constexpr (Len == 5) {
+        int2str<10, 5>(out, static_cast<uint32_t>(value));
+    } else if constexpr (Len == 6) {
+        int2str<10, 6>(out, static_cast<uint32_t>(value));
+    } else if constexpr (Len == 7) {
+        int2str<10, 7>(out, static_cast<uint32_t>(value));
+    } else {
+        int2str<10, 8>(out, static_cast<uint32_t>(value));
+    }
+    return Len;
+}
+
+constexpr std::size_t WriteDecimalSmallest(char* out, uint64_t value) noexcept {
+    if (value < 10) {
+        return WriteDecimalSmall<1>(out, value);
+    }
+    if (value < 100) {
+        return WriteDecimalSmall<2>(out, value);
+    }
+    if (value < 1000) {
+        return WriteDecimalSmall<3>(out, value);
+    }
+    if (value < 10000) {
+        return WriteDecimalSmall<4>(out, value);
+    }
+    if (value < 100000) {
+        return WriteDecimalSmall<5>(out, value);
+    }
+    if (value < 1000000) {
+        return WriteDecimalSmall<6>(out, value);
+    }
+    if (value < 10000000) {
+        return WriteDecimalSmall<7>(out, value);
+    }
+    return WriteDecimalSmall<8>(out, value);
+}
+
+#if defined(__x86_64__) || defined(_M_X64)
+constexpr void WriteDecimalEightPadded(char* out, uint32_t value) noexcept {
+    constexpr uint64_t kZero = 0x3030303030303030ull;
+    Store<uint64_t>(out, ::fastconv_detail::PrepareDecimalEight(value) + kZero);
+}
+#endif
+
+constexpr std::size_t WriteDecimalUint64(char* out, uint64_t value) noexcept {
+    constexpr uint64_t kChunk = 100000000ull;
+    constexpr uint64_t kChunk2 = 10000000000000000ull;
+
+    if (value < kChunk) {
+        return WriteDecimalSmallest(out, value);
+    }
+
+    if (value < kChunk2) {
+        const uint64_t high = value / kChunk;
+        const uint64_t low = value - high * kChunk;
+        const std::size_t high_len = WriteDecimalSmallest(out, high);
+#if defined(__x86_64__) || defined(_M_X64)
+        WriteDecimalEightPadded(out + high_len, static_cast<uint32_t>(low));
+#else
+        int2str<10, 8>(out + high_len, static_cast<uint32_t>(low));
+#endif
+        return high_len + 8;
+    }
+
+    const uint64_t high = value / kChunk2;
+    const uint64_t remainder = value - high * kChunk2;
+    const uint64_t middle = remainder / kChunk;
+    const uint64_t low = remainder - middle * kChunk;
+    const std::size_t high_len = WriteDecimalSmallest(out, high);
+#if defined(__x86_64__) || defined(_M_X64)
+    WriteDecimalEightPadded(out + high_len, static_cast<uint32_t>(middle));
+    WriteDecimalEightPadded(out + high_len + 8, static_cast<uint32_t>(low));
+#else
+    int2str<10, 8>(out + high_len, static_cast<uint32_t>(middle));
+    int2str<10, 8>(out + high_len + 8, static_cast<uint32_t>(low));
+#endif
+    return high_len + 16;
+}
+
+}  // namespace fastconv_detail
+
+template <unsigned Radix, unsigned Len, FastconvInteger T>
 constexpr bool int2str_padded(
     char* out, T value, std::size_t output_len) noexcept {
-    if constexpr (requires {
+    // A <=64-bit runtime value should not be promoted to uint128 merely
+    // because the next fixed-width bucket is wider than the value itself.
+    // The chunked path below is both portable to MSVC and faster on the
+    // measured GCC/Clang targets.
+    if constexpr ((BitsNeeded(Radix, Len) <= 64 ||
+                   sizeof(T) > sizeof(uint64_t)) &&
+                  requires {
                       int2str<Radix, Len>(out, result_t<Radix, Len>{});
                   }) {
         char padded[Len];
@@ -294,7 +695,7 @@ constexpr bool int2str_padded(
     return false;
 }
 
-template <unsigned Radix, std::integral T>
+template <unsigned Radix, FastconvInteger T>
 constexpr bool int2str_dispatch_len(char* out, T value, std::size_t len) noexcept {
     if (len <= 4) {
         return int2str_padded<Radix, 4>(out, value, len);
@@ -317,7 +718,7 @@ constexpr bool int2str_dispatch_len(char* out, T value, std::size_t len) noexcep
     return false;
 }
 
-template <unsigned Radix = 2, std::integral T>
+template <unsigned Radix = 2, FastconvInteger T>
 constexpr bool int2str_dispatch_radix(
     char* out, T value, unsigned radix, std::size_t len) noexcept {
     if (radix == Radix) {
@@ -329,25 +730,237 @@ constexpr bool int2str_dispatch_radix(
     return false;
 }
 
+// Encoding is commonly called with a runtime radix.  A switch lets the
+// compiler select the constant-radix body in one branch, while the analogous
+// parser switch was measured slower and remains on the compact recursive
+// chain in str2int.h.
+template <FastconvInteger T>
+constexpr bool int2str_dispatch_radix_switch(
+    char* out, T value, unsigned radix, std::size_t len) noexcept {
+    switch (radix) {
+        case 2: return int2str_dispatch_len<2>(out, value, len);
+        case 3: return int2str_dispatch_len<3>(out, value, len);
+        case 4: return int2str_dispatch_len<4>(out, value, len);
+        case 5: return int2str_dispatch_len<5>(out, value, len);
+        case 6: return int2str_dispatch_len<6>(out, value, len);
+        case 7: return int2str_dispatch_len<7>(out, value, len);
+        case 8: return int2str_dispatch_len<8>(out, value, len);
+        case 9: return int2str_dispatch_len<9>(out, value, len);
+        case 10: return int2str_dispatch_len<10>(out, value, len);
+        case 11: return int2str_dispatch_len<11>(out, value, len);
+        case 12: return int2str_dispatch_len<12>(out, value, len);
+        case 13: return int2str_dispatch_len<13>(out, value, len);
+        case 14: return int2str_dispatch_len<14>(out, value, len);
+        case 15: return int2str_dispatch_len<15>(out, value, len);
+        case 16: return int2str_dispatch_len<16>(out, value, len);
+        case 17: return int2str_dispatch_len<17>(out, value, len);
+        case 18: return int2str_dispatch_len<18>(out, value, len);
+        case 19: return int2str_dispatch_len<19>(out, value, len);
+        case 20: return int2str_dispatch_len<20>(out, value, len);
+        case 21: return int2str_dispatch_len<21>(out, value, len);
+        case 22: return int2str_dispatch_len<22>(out, value, len);
+        case 23: return int2str_dispatch_len<23>(out, value, len);
+        case 24: return int2str_dispatch_len<24>(out, value, len);
+        case 25: return int2str_dispatch_len<25>(out, value, len);
+        case 26: return int2str_dispatch_len<26>(out, value, len);
+        case 27: return int2str_dispatch_len<27>(out, value, len);
+        case 28: return int2str_dispatch_len<28>(out, value, len);
+        case 29: return int2str_dispatch_len<29>(out, value, len);
+        case 30: return int2str_dispatch_len<30>(out, value, len);
+        case 31: return int2str_dispatch_len<31>(out, value, len);
+        case 32: return int2str_dispatch_len<32>(out, value, len);
+        case 33: return int2str_dispatch_len<33>(out, value, len);
+        case 34: return int2str_dispatch_len<34>(out, value, len);
+        case 35: return int2str_dispatch_len<35>(out, value, len);
+        case 36: return int2str_dispatch_len<36>(out, value, len);
+        default: return false;
+    }
+}
+
+// The fixed-width table is intentionally sparse for narrow runtime values: for
+// example, a 22-digit radix-5 value fits in uint64_t but not in the next
+// power-of-two template (32 digits). Divide the value into radix^8 chunks in
+// that case. radix^8 is below 2^42 for every supported radix, so this path is
+// entirely uint64_t arithmetic and never asks the compiler for a 128-bit
+// division helper.
+template <FastconvInteger U>
+    requires (FastconvUnsignedInteger<U> && sizeof(U) <= sizeof(uint64_t))
+constexpr std::size_t int2str_chunked64(
+    char* out, U value, unsigned radix, std::size_t len) noexcept {
+    const uint64_t r = radix;
+    const uint64_t r2 = r * r;
+    const uint64_t r4 = r2 * r2;
+    const uint64_t group = r4 * r4;
+
+    uint64_t remaining = static_cast<uint64_t>(value);
+    const std::size_t count = (len - 1) / 8;
+    std::size_t offset = len;
+
+    // The low chunks are independent fixed-width fields.  Writing them from
+    // the end lets the leading, non-padded chunk be emitted in place too; no
+    // scratch arrays (and therefore no stack-protector frame) are required.
+    for (std::size_t i = 0; i < count; ++i) {
+        const uint64_t chunk = remaining % group;
+        remaining /= group;
+        offset -= 8;
+        if (!int2str_dispatch_radix_switch(
+                out + offset, static_cast<uint64_t>(chunk), radix, 8)) {
+            uint64_t padded = chunk;
+            for (unsigned j = 8; j-- > 0;) {
+                out[offset + j] = DigitChar(
+                    static_cast<unsigned>(padded % static_cast<uint64_t>(radix)));
+                padded /= static_cast<uint64_t>(radix);
+            }
+        }
+    }
+
+    // `remaining` is the leading chunk and has exactly `len - offset` digits.
+    // Fill it right-to-left so the caller receives the unpadded representation.
+    while (offset != 0) {
+        out[--offset] = DigitChar(
+            static_cast<unsigned>(remaining % static_cast<uint64_t>(radix)));
+        remaining /= static_cast<uint64_t>(radix);
+    }
+    return len;
+}
+
+// A compact table of constant-radix writers keeps the hot short-value path
+// small while replacing variable-width division for values that do not fit a
+// <=64-bit fixed-width bucket. This path is used even when native uint128 is
+// available so conversions of narrower integer types never depend on it.
+template <unsigned Radix, FastconvInteger U>
+    requires (IsValidRadix(Radix) && FastconvUnsignedInteger<U> &&
+              sizeof(U) <= sizeof(uint64_t))
+constexpr std::size_t int2str_chunked64_const(
+    char* out, U value, std::size_t len) noexcept {
+    constexpr uint64_t group = Pow<uint64_t>(Radix, 8);
+    uint64_t remaining = static_cast<uint64_t>(value);
+    const std::size_t count = (len - 1) / 8;
+    std::size_t offset = len;
+    for (std::size_t i = 0; i < count; ++i) {
+        const uint64_t chunk = remaining % group;
+        remaining /= group;
+        offset -= 8;
+        int2str<Radix, 8>(out + offset,
+                          static_cast<result_t<Radix, 8>>(chunk));
+    }
+    while (offset != 0) {
+        out[--offset] = DigitChar(
+            static_cast<unsigned>(remaining % static_cast<uint64_t>(Radix)));
+        remaining /= static_cast<uint64_t>(Radix);
+    }
+    return len;
+}
+
+// Octal is the one runtime radix whose 16-digit group still fits comfortably
+// in 64 bits (`8^16 == 2^48`).  Using that wider group removes one variable
+// divide for the 17..22 digit uint64_t cases; the two resulting 8-digit
+// fields are handled by the existing packed writer.
+template <FastconvInteger U>
+    requires (FastconvUnsignedInteger<U> && sizeof(U) <= sizeof(uint64_t))
+constexpr std::size_t int2str_chunked64_oct(
+    char* out, U value, std::size_t len) noexcept {
+    constexpr uint64_t kGroup = Pow<uint64_t>(8, 16);
+    constexpr uint64_t kHalf = Pow<uint64_t>(8, 8);
+    uint64_t remaining = static_cast<uint64_t>(value);
+    const std::size_t count = (len - 1) / 16;
+    std::size_t offset = len;
+
+    for (std::size_t i = 0; i < count; ++i) {
+        const uint64_t chunk = remaining % kGroup;
+        remaining /= kGroup;
+        offset -= 16;
+        int2str<8, 8>(out + offset,
+                      static_cast<result_t<8, 8>>(chunk / kHalf));
+        int2str<8, 8>(out + offset + 8,
+                      static_cast<result_t<8, 8>>(chunk % kHalf));
+    }
+    while (offset != 0) {
+        out[--offset] = DigitChar(static_cast<unsigned>(remaining & 7u));
+        remaining >>= 3;
+    }
+    return len;
+}
+
+template <FastconvInteger U>
+    requires (FastconvUnsignedInteger<U> && sizeof(U) <= sizeof(uint64_t))
+constexpr std::size_t int2str_chunked64_dispatch(
+    char* out, U value, unsigned radix, std::size_t len) noexcept {
+    switch (radix) {
+        case 8: return int2str_chunked64_oct(out, value, len);
+        case 3: return int2str_chunked64_const<3>(out, value, len);
+        case 5: return int2str_chunked64_const<5>(out, value, len);
+        case 6: return int2str_chunked64_const<6>(out, value, len);
+        case 7: return int2str_chunked64_const<7>(out, value, len);
+        case 9: return int2str_chunked64_const<9>(out, value, len);
+        case 10: return int2str_chunked64_const<10>(out, value, len);
+        case 11: return int2str_chunked64_const<11>(out, value, len);
+        case 12: return int2str_chunked64_const<12>(out, value, len);
+        case 13: return int2str_chunked64_const<13>(out, value, len);
+        case 14: return int2str_chunked64_const<14>(out, value, len);
+        case 15: return int2str_chunked64_const<15>(out, value, len);
+        case 17: return int2str_chunked64_const<17>(out, value, len);
+        case 18: return int2str_chunked64_const<18>(out, value, len);
+        case 19: return int2str_chunked64_const<19>(out, value, len);
+        case 20: return int2str_chunked64_const<20>(out, value, len);
+        case 21: return int2str_chunked64_const<21>(out, value, len);
+        case 22: return int2str_chunked64_const<22>(out, value, len);
+        case 23: return int2str_chunked64_const<23>(out, value, len);
+        case 24: return int2str_chunked64_const<24>(out, value, len);
+        case 25: return int2str_chunked64_const<25>(out, value, len);
+        case 26: return int2str_chunked64_const<26>(out, value, len);
+        case 27: return int2str_chunked64_const<27>(out, value, len);
+        case 28: return int2str_chunked64_const<28>(out, value, len);
+        case 29: return int2str_chunked64_const<29>(out, value, len);
+        case 30: return int2str_chunked64_const<30>(out, value, len);
+        case 31: return int2str_chunked64_const<31>(out, value, len);
+        case 32: return int2str_chunked64_const<32>(out, value, len);
+        case 33: return int2str_chunked64_const<33>(out, value, len);
+        case 34: return int2str_chunked64_const<34>(out, value, len);
+        case 35: return int2str_chunked64_const<35>(out, value, len);
+        case 36: return int2str_chunked64_const<36>(out, value, len);
+        default: return int2str_chunked64(out, value, radix, len);
+    }
+}
+
 // Runtime dispatch facade. It first determines the shortest representation;
 // supported lengths are then written by the compile-time specialization.
-template <std::integral T>
+template <FastconvInteger T>
 constexpr std::size_t int2str(char* out, T value, unsigned radix) noexcept {
+    if (!IsValidRadix(radix)) {
+        return 0;
+    }
     if constexpr (std::same_as<std::remove_cv_t<T>, bool>) {
         out[0] = static_cast<char>('0' + value);
         return 1;
     } else {
-        T remaining = value;
-        std::size_t len = 1;
-        while (remaining >= static_cast<T>(radix)) {
-            remaining = static_cast<T>(remaining / radix);
-            ++len;
+        if constexpr (FastconvIsSigned<T>) {
+            using U = fastconv_runtime_detail::unsigned_integer_t<T>;
+            const U magnitude = fastconv_runtime_detail::UnsignedMagnitude(value);
+            if (value < 0) {
+                out[0] = '-';
+                return 1 + int2str(out + 1, magnitude, radix);
+            }
+            return int2str(out, magnitude, radix);
         }
-
-        if (int2str_dispatch_radix(out, value, radix, len)) {
+        if constexpr (FastconvIsUnsigned<T> && sizeof(T) <= sizeof(uint64_t) &&
+                      !std::same_as<std::remove_cv_t<T>, bool>) {
+            if (radix == 10) {
+                return fastconv_detail::WriteDecimalUint64(
+                    out, static_cast<uint64_t>(value));
+            }
+        }
+        using U = fastconv_runtime_detail::unsigned_integer_t<T>;
+        const U magnitude = fastconv_runtime_detail::UnsignedMagnitude(value);
+        const std::size_t len =
+            fastconv_runtime_detail::RuntimeDigitCount(magnitude, radix);
+        if (int2str_dispatch_radix_switch(out, magnitude, radix, len)) {
             return len;
         }
-        return int2str_fallback(out, value, radix);
+        if constexpr (sizeof(U) <= sizeof(uint64_t)) {
+            return int2str_chunked64_dispatch(out, magnitude, radix, len);
+        }
+        return int2str_fallback(out, magnitude, radix);
     }
 }
 
@@ -372,7 +985,11 @@ constexpr std::size_t int2str(char* out, T value, unsigned radix) noexcept {
 #if defined(FASTCONV_X86_SIMD)
 #include <immintrin.h>
 #else
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <arm64_neon.h>
+#else
 #include <arm_neon.h>
+#endif
 #endif
 
 namespace simd {
@@ -479,24 +1096,49 @@ template <unsigned Radix, unsigned Len>
     requires (2 <= Radix && Radix <= 36 && Len % 8 == 0 &&
               BitsNeeded(Radix, Len) <= kFastconvMaxBits)
 constexpr void int2str(char* out, result_t<Radix, Len> value) noexcept {
-    constexpr auto kGroup = Pow<result_t<Radix, Len>>(Radix, 8);
-
-    if constexpr (Radix == 10 && Len == 16) {
-        Decimal16(out, static_cast<uint64_t>(value));
-    } else if constexpr (Len > 8) {
-        int2str<Radix, Len - 8>(out, static_cast<result_t<Radix, Len - 8>>(value / kGroup));
-        int2str<Radix, 8>(out + Len - 8,
-                          static_cast<result_t<Radix, 8>>(value % kGroup));
+    if consteval {
+        auto v = value;
+        for (unsigned i = Len; i-- > 0;) {
+            out[i] = DigitChar(static_cast<unsigned>(v % Radix));
+            v /= Radix;
+        }
     } else {
-        constexpr auto r2 = Pow<uint64_t>(Radix, 2);
-        constexpr auto r4 = r2 * r2;
+        constexpr auto kGroup = Pow<uint64_t>(Radix, 8);
 
-        const uint64_t v = static_cast<uint64_t>(value);
-        const uint64_t h = v / r4;
-        const uint64_t l = v % r4;
-        const uint16_t pair[4] = {static_cast<uint16_t>(h / r2), static_cast<uint16_t>(h % r2),
-                                  static_cast<uint16_t>(l / r2), static_cast<uint16_t>(l % r2)};
-        EightDigits<Radix>(out, pair);
+#if FASTCONV_HAS_NATIVE_UINT128
+        if constexpr (Len == 64 && ReciprocalSplit<Radix, 64, 32>) {
+            const auto parts = fastconv_detail::ReciprocalDivide<Radix, 64, 32>(value);
+            int2str<Radix, 32>(out, parts.quotient);
+            int2str<Radix, 32>(out + 32, parts.remainder);
+        } else if constexpr (Len == 32 && ReciprocalSplit<Radix, 32, 16>) {
+            const auto parts = fastconv_detail::ReciprocalDivide<Radix, 32, 16>(value);
+            int2str<Radix, 16>(out, parts.quotient);
+            int2str<Radix, 16>(out + 16, parts.remainder);
+        } else if constexpr (Len == 16 && ReciprocalSplit<Radix, 16, 8>) {
+            const auto parts = fastconv_detail::ReciprocalDivide<Radix, 16, 8>(value);
+            int2str<Radix, 8>(out, parts.quotient);
+            int2str<Radix, 8>(out + 8, parts.remainder);
+        } else
+#endif
+        if constexpr (Radix == 10 && Len == 16) {
+            Decimal16(out, static_cast<uint64_t>(value));
+        } else if constexpr (Len > 8) {
+            int2str<Radix, Len - 8>(
+                out, static_cast<result_t<Radix, Len - 8>>(value / kGroup));
+            int2str<Radix, 8>(out + Len - 8,
+                              static_cast<result_t<Radix, 8>>(value % kGroup));
+        } else {
+            constexpr auto r2 = Pow<uint64_t>(Radix, 2);
+            constexpr auto r4 = r2 * r2;
+
+            const uint64_t v = static_cast<uint64_t>(value);
+            const uint64_t h = v / r4;
+            const uint64_t l = v % r4;
+            const uint16_t pair[4] = {
+                static_cast<uint16_t>(h / r2), static_cast<uint16_t>(h % r2),
+                static_cast<uint16_t>(l / r2), static_cast<uint16_t>(l % r2)};
+            EightDigits<Radix>(out, pair);
+        }
     }
 }
 
